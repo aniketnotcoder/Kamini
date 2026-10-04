@@ -1857,14 +1857,8 @@ def _build_dom_post_object(
     return feed_object
 
 
-def _find_dom_post_match(html: str, requested_slug: str, base_url: str) -> Optional[Dict[str, Any]]:
-    """
-    Parse the actual direct `/post/<slug>` page.
-
-    This is intentionally NOT a feed-card parser.  Individual post pages do
-    not render the main post as an `<a href="/feed/<slug>">` card.  Instead the
-    page has a channel header, one `<h1>`, then the main media wrapper.
-    """
+def _find_dom_feed_match(html: str, requested_slug: str, base_url: str) -> Optional[Dict[str, Any]]:
+    """Parse the main post rendered by an upstream ``/feed/<slug>`` page."""
     wanted = normalize_slug(requested_slug)
     if not wanted:
         return None
@@ -1874,16 +1868,11 @@ def _find_dom_post_match(html: str, requested_slug: str, base_url: str) -> Optio
     if h1 is None:
         return None
 
-    # The direct post route is already the requested slug.  We still verify any
-    # explicit canonical/path evidence when it exists, but we do not require a
-    # `/feed/<slug>` anchor because there isn't one on the main post itself.
-    canonical_slug = None
     canonical = soup.find("link", rel=lambda value: value and "canonical" in value)
     if canonical is not None:
         canonical_slug = extract_slug_from_url(_clean_string(canonical.get("href")) or "")
-
-    if canonical_slug and slug_key(canonical_slug) != slug_key(wanted):
-        return None
+        if canonical_slug and slug_key(canonical_slug) != slug_key(wanted):
+            return None
 
     feed_object = _build_dom_post_object(h1, wanted, html, base_url)
     if feed_object is None:
@@ -1892,44 +1881,153 @@ def _find_dom_post_match(html: str, requested_slug: str, base_url: str) -> Optio
     return build_public_item(feed_object, base_url)
 
 
-def extract_post_recommendations(
+def _find_dom_post_match(html: str, requested_slug: str, base_url: str) -> Optional[Dict[str, Any]]:
+    """Parse the main post rendered by an upstream ``/post/<slug>`` page."""
+    wanted = normalize_slug(requested_slug)
+    if not wanted:
+        return None
+
+    soup = _soup(html)
+    h1 = soup.find("h1")
+    if h1 is None:
+        return None
+
+    canonical = soup.find("link", rel=lambda value: value and "canonical" in value)
+    if canonical is not None:
+        canonical_slug = extract_slug_from_url(_clean_string(canonical.get("href")) or "")
+        if canonical_slug and slug_key(canonical_slug) != slug_key(wanted):
+            return None
+
+    feed_object = _build_dom_post_object(h1, wanted, html, base_url)
+    if feed_object is None:
+        return None
+
+    return build_public_item(feed_object, base_url)
+
+
+def _recommendation_thumbnail(anchor: Any, base_url: str) -> Optional[str]:
+    """Extract the displayed recommendation thumbnail from a card anchor."""
+    for image in anchor.find_all("img"):
+        alt = _clean_string(image.get("alt"))
+        aria_hidden = (_clean_string(image.get("aria-hidden")) or "").lower()
+        classes = image.get("class", [])
+        if isinstance(classes, str):
+            classes = classes.split()
+        if aria_hidden == "true" or not alt or "blur" in " ".join(classes or []).lower():
+            continue
+        source = _dom_image_source(image)
+        if source:
+            return absolute_url(source, base_url)
+
+    # Some cards only expose the blurred image.  It is still a useful card
+    # thumbnail when no non-blurred image exists.
+    image = anchor.find("img")
+    if image is not None:
+        source = _dom_image_source(image)
+        if source:
+            return absolute_url(source, base_url)
+    return None
+
+
+def _build_dom_recommendation_item(anchor: Any, base_url: str) -> Optional[Dict[str, Any]]:
+    """Build a lightweight public recommendation from a /post/ card."""
+    href = _clean_string(anchor.get("href")) or ""
+    parsed = urlparse(href)
+    path = parsed.path.strip("/")
+    if not path.startswith("post/"):
+        return None
+
+    slug = normalize_slug(path[5:])
+    if not slug:
+        return None
+
+    title = _clean_string(anchor.get_text(" ", strip=True))
+    if not title:
+        image = anchor.find("img", alt=True)
+        title = _clean_string(image.get("alt")) if image is not None else None
+    if not title:
+        return None
+
+    thumbnail = _recommendation_thumbnail(anchor, base_url)
+    item = {
+        "title": title,
+        "slug": slug,
+        "url": absolute_url(href, base_url),
+        "type": "unknown",
+        "media_count": 0,
+        "video_count": 0,
+        "image_count": 0,
+        "media": [],
+        "embed_url": None,
+        "video_id": None,
+        "video_url": None,
+        "thumbnail": thumbnail,
+        "duration": None,
+        "id": None,
+        "channel_id": None,
+        "channel_name": None,
+        "username": None,
+        "avatar": None,
+        "created_at": None,
+    }
+    return item
+
+
+def extract_feed_post_recommendations(
     html: str,
     requested_slug: str,
     base_url: str,
 ) -> List[Dict[str, Any]]:
-    """
-    Extract the recommendation cards rendered in the direct post page's
-    ``You might like:`` section.
-
-    On Desihub's direct post pages the main post is rendered directly in the
-    page component, while recommendation cards are serialized as normal RSC
-    ``feed`` objects.  Therefore the existing RSC feed-object extractor is the
-    correct source for recommendations here.
-
-    The requested post is excluded defensively in case the upstream response
-    ever includes it in its own recommendation list.  Order is preserved.
-    """
+    """Extract rich ``/feed/<slug>`` recommendations from the page RSC data."""
     wanted = normalize_slug(requested_slug)
     if not html or not wanted:
         return []
 
     recommendations: List[Dict[str, Any]] = []
     seen: set = set()
-
     for feed_object in extract_rsc_feed_objects(html):
         slug = normalize_slug(feed_object.get("slug"))
-        if not slug:
+        if not slug or slug_key(slug) == slug_key(wanted):
             continue
-
-        if slug_key(slug) == slug_key(wanted):
-            continue
-
         identity = _feed_object_identity(feed_object)
         if identity in seen:
             continue
-
         seen.add(identity)
         recommendations.append(build_public_item(feed_object, base_url))
+    return recommendations
+
+
+def extract_post_recommendations(
+    html: str,
+    requested_slug: str,
+    base_url: str,
+) -> List[Dict[str, Any]]:
+    """Extract ``/post/<slug>`` recommendation cards from a direct post page."""
+    wanted = normalize_slug(requested_slug)
+    if not html or not wanted:
+        return []
+
+    soup = _soup(html)
+    recommendations: List[Dict[str, Any]] = []
+    seen: set = set()
+
+    for anchor in soup.find_all("a", href=True):
+        href = _clean_string(anchor.get("href")) or ""
+        path = urlparse(href).path.strip("/")
+        if not path.startswith("post/"):
+            continue
+
+        item = _build_dom_recommendation_item(anchor, base_url)
+        if item is None:
+            continue
+        slug = item["slug"]
+        if slug_key(slug) == slug_key(wanted):
+            continue
+        key = slug_key(slug)
+        if key in seen:
+            continue
+        seen.add(key)
+        recommendations.append(item)
 
     return recommendations
 
@@ -1951,147 +2049,71 @@ def _attach_post_recommendations(
     return item
 
 
+def parse_feed_post_page(
+    html: str,
+    requested_slug: str,
+    base_url: str,
+) -> Optional[Dict[str, Any]]:
+    """Parse exactly one upstream ``/feed/<slug>`` page.
+
+    The main Feed post is rendered in the DOM.  Its recommendation objects are
+    the RSC ``feed`` records.  This parser never expects the requested slug to
+    appear in those recommendation records.
+    """
+    wanted = normalize_slug(requested_slug)
+    if not wanted:
+        return None
+
+    item = _find_dom_feed_match(html, wanted, base_url)
+    if item is None:
+        return None
+
+    recommendations = extract_feed_post_recommendations(html, wanted, base_url)
+    item["recommendation_count"] = len(recommendations)
+    item["recommendations"] = recommendations
+    return item
+
+
 def parse_post_page(
     html: str,
     requested_slug: str,
     base_url: str,
     route_hint: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Parse one post using the exact upstream route family.
-
-    ``/feed/<slug>`` and ``/post/<slug>`` are intentionally different page
-    types on Desihub.  Feed-post pages are parsed from their RSC ``feed``
-    object because that object contains the rich feed media/channel fields.
-    Direct ``/post/<slug>`` pages are parsed from their rendered DOM first;
-    their RSC feed objects are recommendations rather than the main post.
-
-    ``route_hint`` is supplied by the API layer so we never silently switch
-    from one route family to the other.
-    """
+    """Parse exactly one upstream ``/post/<slug>`` page."""
     wanted = normalize_slug(requested_slug)
     if not wanted:
         return None
 
-    route = (route_hint or "").strip().lower()
-
-    # ------------------------------------------------------------------
-    # FEED POST: /feed/<slug>
-    # ------------------------------------------------------------------
-    # This is deliberately the first and preferred parser for Feed URLs.
-    # The feed RSC object is the source of media/channel/recommendation data.
-    if route == "feed":
-        feed_objects = extract_rsc_feed_objects(html)
-        match = find_feed_object_by_slug(feed_objects, wanted)
-
-        if match is not None:
-            return _attach_post_recommendations(
-                build_public_item(match, base_url),
-                html,
-                wanted,
-                base_url,
-            )
-
-        stream = combined_rsc_payload(html)
-        near_slug_match = _extract_feed_object_near_slug(stream, wanted)
-        if near_slug_match is not None:
-            return _attach_post_recommendations(
-                build_public_item(near_slug_match, base_url),
-                html,
-                wanted,
-                base_url,
-            )
-
-        partial_match = _extract_post_object_from_stream_by_slug(stream, wanted)
-        if partial_match is not None:
-            return _attach_post_recommendations(
-                build_public_item(partial_match, base_url),
-                html,
-                wanted,
-                base_url,
-            )
-
+    route = (route_hint or "post").strip().lower()
+    if route != "post":
         return None
 
-    # ------------------------------------------------------------------
-    # DIRECT POST: /post/<slug>
-    # ------------------------------------------------------------------
-    # The direct post page has its own rendered main-post component.  Do not
-    # mistake recommendation feed objects for the requested post.
-    if route == "post":
-        dom_match = _find_dom_post_match(html, wanted, base_url)
-        if dom_match is not None:
-            return _attach_post_recommendations(dom_match, html, wanted, base_url)
-
-        # Secondary recovery for unusual upstream revisions that serialize the
-        # main post as a feed object too.  This is still strictly inside the
-        # /post route and does not fall back to fetching /feed/<slug>.
+    item = _find_dom_post_match(html, wanted, base_url)
+    if item is None:
+        # Recovery is deliberately restricted to this /post response.  Never
+        # fetch or infer a /feed/<slug> route here.
         stream = combined_rsc_payload(html)
         feed_objects = extract_rsc_feed_objects(html)
         match = find_feed_object_by_slug(feed_objects, wanted)
         if match is not None:
-            return _attach_post_recommendations(
-                build_public_item(match, base_url),
-                html,
-                wanted,
-                base_url,
-            )
+            item = build_public_item(match, base_url)
+        else:
+            near_slug_match = _extract_feed_object_near_slug(stream, wanted)
+            if near_slug_match is not None:
+                item = build_public_item(near_slug_match, base_url)
+            else:
+                partial_match = _extract_post_object_from_stream_by_slug(stream, wanted)
+                if partial_match is not None:
+                    item = build_public_item(partial_match, base_url)
 
-        near_slug_match = _extract_feed_object_near_slug(stream, wanted)
-        if near_slug_match is not None:
-            return _attach_post_recommendations(
-                build_public_item(near_slug_match, base_url),
-                html,
-                wanted,
-                base_url,
-            )
-
-        partial_match = _extract_post_object_from_stream_by_slug(stream, wanted)
-        if partial_match is not None:
-            return _attach_post_recommendations(
-                build_public_item(partial_match, base_url),
-                html,
-                wanted,
-                base_url,
-            )
-
+    if item is None:
         return None
 
-    # Backward-compatible behavior for callers that do not provide a route.
-    # Prefer the direct DOM parser, then use the robust RSC recovery.
-    dom_match = _find_dom_post_match(html, wanted, base_url)
-    if dom_match is not None:
-        return _attach_post_recommendations(dom_match, html, wanted, base_url)
-
-    stream = combined_rsc_payload(html)
-    feed_objects = extract_rsc_feed_objects(html)
-    match = find_feed_object_by_slug(feed_objects, wanted)
-    if match is not None:
-        return _attach_post_recommendations(
-            build_public_item(match, base_url),
-            html,
-            wanted,
-            base_url,
-        )
-
-    near_slug_match = _extract_feed_object_near_slug(stream, wanted)
-    if near_slug_match is not None:
-        return _attach_post_recommendations(
-            build_public_item(near_slug_match, base_url),
-            html,
-            wanted,
-            base_url,
-        )
-
-    partial_match = _extract_post_object_from_stream_by_slug(stream, wanted)
-    if partial_match is not None:
-        return _attach_post_recommendations(
-            build_public_item(partial_match, base_url),
-            html,
-            wanted,
-            base_url,
-        )
-
-    return None
+    recommendations = extract_post_recommendations(html, wanted, base_url)
+    item["recommendation_count"] = len(recommendations)
+    item["recommendations"] = recommendations
+    return item
 
 
 # -----------------------------------------------------------------------------
