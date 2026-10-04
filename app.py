@@ -27,8 +27,8 @@ async def health():
     }
 
 
-@app.get("/api/scrape")
-async def scrape():
+@app.get("/api/feed/{page}")
+async def scrape_feed(page: int):
 
     target = f"https://desihub.sh/feed/{page}"
 
@@ -41,6 +41,7 @@ async def scrape():
 
     return {
         "source": target,
+        "page": page,
         "status": result["status"],
         "final_url": result["url"],
         **parsed
