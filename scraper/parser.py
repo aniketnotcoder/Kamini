@@ -853,19 +853,20 @@ def parse_page(source_html, page_url):
             }
         )
 
-    # ========================================================
-    # PAGINATION
-    # ========================================================
+# ========================================================
+# PAGINATION
+# ========================================================
 
 current_page = extract_page_number(
-        page_url
-    )
+    page_url
+)
 
-    pagination = extract_pagination(
-        soup,
-        page_url,
-        current_page,
-    )
+pagination = extract_pagination(
+    soup,
+    page_url,
+    current_page,
+)
+
 
     # Page 2+ previous-page fallback.
     if (
