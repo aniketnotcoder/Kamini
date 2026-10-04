@@ -31,6 +31,7 @@ from fastapi import FastAPI, HTTPException, Request
 
 from fetcher import fetch_page
 from scraper.parser import (
+    extract_embed_video_metadata,
     extract_generic_page_number_from_url,
     extract_page_number_from_url,
     normalize_slug,
@@ -49,6 +50,7 @@ BASE_URL = "https://desihub.sh"
 # page normally contains 12 cards, so this avoids turning one API request into
 # a burst of 12+ simultaneous upstream requests.
 SEARCH_ENRICH_CONCURRENCY = 4
+FEED_MEDIA_ENRICH_CONCURRENCY = 4
 
 app = FastAPI(
     title="Desihub Scraper API",
@@ -480,6 +482,83 @@ async def enrich_search_results(items: Any) -> List[Dict[str, Any]]:
 
 
 # -----------------------------------------------------------------------------
+# Individual Feed media metadata enrichment
+# -----------------------------------------------------------------------------
+
+
+async def _enrich_feed_media_item(
+    item: Dict[str, Any],
+    semaphore: asyncio.Semaphore,
+) -> Dict[str, Any]:
+    """Resolve rich metadata for one Feed-post iframe without changing its ID."""
+    if not isinstance(item, dict) or item.get("type") != "video":
+        return item
+
+    embed_url = item.get("embed_url")
+    if not embed_url:
+        return item
+
+    async with semaphore:
+        try:
+            result = await fetch_page(str(embed_url))
+            embed_html = result.get("html") or ""
+            if not embed_html:
+                return item
+
+            metadata = extract_embed_video_metadata(embed_html, BASE_URL)
+        except Exception:
+            # Metadata enrichment is deliberately best-effort.  The Feed post
+            # itself is already valid, so an embed failure must never turn the
+            # whole endpoint into a 502/500.
+            return item
+
+    enriched = dict(item)
+
+    if metadata.get("video_url"):
+        enriched["video_url"] = metadata["video_url"]
+    if metadata.get("thumbnail"):
+        enriched["thumbnail"] = metadata["thumbnail"]
+    if metadata.get("duration") is not None:
+        enriched["duration"] = metadata["duration"]
+
+    return enriched
+
+
+async def enrich_feed_post_media(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Enrich all Feed-post video media concurrently while preserving order."""
+    media = item.get("media") if isinstance(item, dict) else None
+    if not isinstance(media, list) or not media:
+        return item
+
+    semaphore = asyncio.Semaphore(FEED_MEDIA_ENRICH_CONCURRENCY)
+    tasks = [
+        _enrich_feed_media_item(media_item, semaphore)
+        for media_item in media
+        if isinstance(media_item, dict)
+    ]
+
+    if not tasks:
+        return item
+
+    enriched_media = await asyncio.gather(*tasks, return_exceptions=False)
+    result = dict(item)
+    result["media"] = enriched_media
+
+    videos = [entry for entry in enriched_media if entry.get("type") == "video"]
+    first_video = videos[0] if videos else None
+
+    # Keep the legacy top-level fields synchronized with the enriched first
+    # video, exactly like build_public_item() does for RSC feed objects.
+    result["embed_url"] = first_video.get("embed_url") if first_video else None
+    result["video_id"] = first_video.get("video_id") if first_video else None
+    result["video_url"] = first_video.get("video_url") if first_video else None
+    result["thumbnail"] = first_video.get("thumbnail") if first_video else None
+    result["duration"] = first_video.get("duration") if first_video else None
+
+    return result
+
+
+# -----------------------------------------------------------------------------
 # Routes
 # -----------------------------------------------------------------------------
 
@@ -593,6 +672,11 @@ async def feed_post_page(request: Request, slug: str) -> Dict[str, Any]:
                 "rsc_feed_count": debug.get("feed_object_count", 0),
             },
         )
+
+    # Feed pages render their main videos as iframe URLs, so the page itself
+    # does not carry the rich videoUrl/thumbnail/duration fields that the RSC
+    # recommendation objects carry. Resolve those fields from each embed page.
+    parsed = await enrich_feed_post_media(parsed)
 
     return {
         **parsed,
