@@ -1892,6 +1892,7 @@ def _build_dom_post_object(
     requested_slug: str,
     html: str,
     base_url: str,
+    route_hint: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Build a feed-shaped object from the direct post DOM."""
     title = _clean_string(h1.get_text(" ", strip=True)) if h1 is not None else None
@@ -1900,6 +1901,35 @@ def _build_dom_post_object(
 
     media_container = _find_main_post_media_container(h1)
     media = _extract_direct_post_media(media_container, base_url)
+
+    # Feed-post pages render the video's visual/preview image as a separate
+    # DOM block after the iframe. That image is not a second post item. For the
+    # /feed/<slug> family, keep the iframe media only and reconstruct the same
+    # direct MP4 URL the upstream feed objects use.
+    if route_hint == "feed" and media:
+        video_media = [item for item in media if item.get("type") == "video"]
+        if video_media:
+            media = video_media
+            for item in media:
+                video_id = item.get("video_id") or item.get("videoId") or item.get("id")
+                if video_id and not item.get("video_url"):
+                    item["video_url"] = f"https://videos.downloaddirect.xyz/{video_id}.mp4"
+                if video_id and not item.get("thumbnail"):
+                    # The feed template's following image block is the video
+                    # preview. Find the first usable non-hidden image.
+                    if media_container is not None:
+                        for image in media_container.find_all("img"):
+                            aria_hidden = (_clean_string(image.get("aria-hidden")) or "").lower()
+                            alt = _clean_string(image.get("alt"))
+                            classes = image.get("class", [])
+                            if isinstance(classes, str):
+                                classes = classes.split()
+                            if aria_hidden == "true" or "blur-2xl" in " ".join(classes or []).lower():
+                                continue
+                            image_url = _dom_image_source(image)
+                            if image_url:
+                                item["thumbnail"] = image_url
+                                break
 
     # Main-site /post/<slug> pages use a different template: the media is
     # inside the surrounding <article>, not the Feed template's
@@ -1948,7 +1978,7 @@ def detect_post_route(url: Any) -> Optional[str]:
     return None
 
 
-def _find_dom_post_match(html: str, requested_slug: str, base_url: str) -> Optional[Dict[str, Any]]:
+def _find_dom_post_match(html: str, requested_slug: str, base_url: str, route_hint: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """
     Parse the actual direct `/post/<slug>` page.
 
@@ -1976,7 +2006,7 @@ def _find_dom_post_match(html: str, requested_slug: str, base_url: str) -> Optio
     if canonical_slug and slug_key(canonical_slug) != slug_key(wanted):
         return None
 
-    feed_object = _build_dom_post_object(h1, wanted, html, base_url)
+    feed_object = _build_dom_post_object(h1, wanted, html, base_url, route_hint=route_hint)
     if feed_object is None:
         return None
 
@@ -2133,7 +2163,7 @@ def parse_post_page(
     # Both page families have a rendered H1/media DOM.  The parser's DOM
     # selectors are template-aware, so use that first for the known family.
     if route in (None, "post", "feed"):
-        dom_match = _find_dom_post_match(html, wanted, base_url)
+        dom_match = _find_dom_post_match(html, wanted, base_url, route_hint=route)
         if dom_match is not None:
             if route:
                 resolved_route = route
