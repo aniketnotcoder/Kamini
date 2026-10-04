@@ -1,402 +1,293 @@
-import re
 import html as html_lib
-from urllib.parse import urljoin
+import re
+from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
 
-# ============================================================
-# TEXT HELPERS
-# ============================================================
-
 def clean_text(value):
-    if not value:
+    if value is None:
         return None
 
-    value = html_lib.unescape(value)
+    value = html_lib.unescape(str(value))
     value = re.sub(r"\s+", " ", value)
+    value = value.strip()
 
-    return value.strip() or None
+    return value or None
 
 
 def absolute_url(url, base_url):
     if not url:
         return None
 
-    url = html_lib.unescape(url)
+    url = html_lib.unescape(str(url)).strip()
+
+    if url.startswith("//"):
+        return "https:" + url
 
     return urljoin(base_url, url)
 
 
-# ============================================================
-# NEXT.JS MEDIA EXTRACTION
-# ============================================================
+def decode_next_string(value):
+    if not value:
+        return None
+
+    value = value.replace('\\"', '"')
+    value = value.replace("\\/", "/")
+    value = value.replace("\\u0026", "&")
+    value = value.replace("\\u002F", "/")
+
+    try:
+        value = bytes(value, "utf-8").decode("unicode_escape")
+    except Exception:
+        pass
+
+    return html_lib.unescape(value)
+
 
 def extract_next_video_data(source_html):
     """
-    Extract video metadata from Next.js __next_f RSC data.
+    Extract Desihub media information from Next.js RSC data.
 
-    Desihub feed source contains structures similar to:
-
-        "mediaItems":[
-            {
-                "id":"...",
-                "type":"video",
-                "url":"https://downloaddirect.xyz/embed/UUID",
-                "videoId":"UUID",
-                "videoUrl":"https://videos.downloaddirect.xyz/UUID.mp4",
-                "thumbnailUrl":"https://images.downloaddirect.xyz/....webp",
-                "duration":957
-            }
-        ]
-
-    We index the data by videoId so the rendered HTML iframe
-    can be matched against the actual MP4/thumbnail metadata.
+    Expected fields:
+      videoId
+      videoUrl
+      thumbnailUrl
+      duration
     """
 
-    videos = {}
+    data = {}
 
-    if not source_html:
-        return videos
-
-    # --------------------------------------------------------
-    # Next.js may contain escaped JSON:
-    #
-    # \"videoId\":\"...\"
-    #
-    # or normal JSON:
-    #
-    # "videoId":"..."
-    #
-    # This regex supports both.
-    # --------------------------------------------------------
-
-    video_id_pattern = re.compile(
-        r'\\?"videoId\\?"\s*:\s*\\?"([^"\\]+)\\?"',
-        re.IGNORECASE
+    # Find every videoId in the page source.
+    video_matches = list(
+        re.finditer(
+            r'"videoId"\s*:\s*"([^"]+)"',
+            source_html,
+            re.DOTALL,
+        )
     )
 
-    matches = list(video_id_pattern.finditer(source_html))
+    for match in video_matches:
+        video_id = decode_next_string(match.group(1))
 
-    for match in matches:
+        if not video_id:
+            continue
 
-        video_id = match.group(1)
-
-        # ----------------------------------------------------
-        # Only inspect a local window around this media object.
-        #
-        # This prevents accidentally pairing one video's
-        # thumbnail with another video's videoUrl.
-        # ----------------------------------------------------
-
+        # Only inspect a reasonable area around this video object.
         start = match.start()
-        end = min(
-            len(source_html),
-            match.end() + 2500
-        )
+        end = min(len(source_html), start + 5000)
 
         block = source_html[start:end]
 
-        # ----------------------------------------------------
-        # VIDEO URL
-        # ----------------------------------------------------
-
         video_url_match = re.search(
-            r'\\?"videoUrl\\?"\s*:\s*\\?"([^"\\]+)\\?"',
+            r'"videoUrl"\s*:\s*"([^"]+)"',
             block,
-            re.IGNORECASE
+            re.DOTALL,
         )
-
-        video_url = (
-            html_lib.unescape(video_url_match.group(1))
-            if video_url_match
-            else None
-        )
-
-        # ----------------------------------------------------
-        # THUMBNAIL
-        # ----------------------------------------------------
 
         thumbnail_match = re.search(
-            r'\\?"thumbnailUrl\\?"\s*:\s*\\?"([^"\\]+)\\?"',
+            r'"thumbnailUrl"\s*:\s*"([^"]+)"',
             block,
-            re.IGNORECASE
+            re.DOTALL,
         )
-
-        thumbnail = (
-            html_lib.unescape(thumbnail_match.group(1))
-            if thumbnail_match
-            else None
-        )
-
-        # ----------------------------------------------------
-        # DURATION
-        # ----------------------------------------------------
 
         duration_match = re.search(
-            r'\\?"duration\\?"\s*:\s*(\d+)',
+            r'"duration"\s*:\s*(\d+)',
             block,
-            re.IGNORECASE
+            re.DOTALL,
         )
-
-        duration = (
-            int(duration_match.group(1))
-            if duration_match
-            else None
-        )
-
-        # ----------------------------------------------------
-        # EMBED URL
-        # ----------------------------------------------------
 
         embed_match = re.search(
-            r'\\?"url\\?"\s*:\s*\\?"'
-            r'(https?://[^"\\]*?/embed/[^"\\]+)'
-            r'\\?"',
+            r'"url"\s*:\s*"([^"]*?/embed/[^"]+)"',
             block,
-            re.IGNORECASE
+            re.DOTALL,
         )
 
-        embed_url = (
-            html_lib.unescape(embed_match.group(1))
-            if embed_match
-            else None
-        )
-
-        videos[video_id] = {
+        data[video_id] = {
             "video_id": video_id,
-            "embed_url": embed_url,
-            "video_url": video_url,
-            "thumbnail": thumbnail,
-            "duration": duration,
+            "video_url": (
+                decode_next_string(video_url_match.group(1))
+                if video_url_match
+                else None
+            ),
+            "thumbnail": (
+                decode_next_string(thumbnail_match.group(1))
+                if thumbnail_match
+                else None
+            ),
+            "duration": (
+                int(duration_match.group(1))
+                if duration_match
+                else None
+            ),
+            "embed_url": (
+                decode_next_string(embed_match.group(1))
+                if embed_match
+                else None
+            ),
         }
 
-    return videos
+    return data
 
-
-# ============================================================
-# VIDEO ID
-# ============================================================
 
 def extract_video_id(embed_url):
-    """
-    Extract UUID from:
-
-        https://downloaddirect.xyz/embed/<UUID>
-    """
-
     if not embed_url:
         return None
 
+    parsed = urlparse(embed_url)
+
+    path = parsed.path.rstrip("/")
+
     match = re.search(
-        r"/embed/([a-zA-Z0-9-]+)",
-        embed_url
+        r"/embed/([^/?#]+)",
+        path,
+        re.IGNORECASE,
     )
 
-    if not match:
-        return None
+    if match:
+        return match.group(1)
 
-    return match.group(1)
+    return None
 
 
-# ============================================================
-# CHANNEL EXTRACTION
-# ============================================================
-
-def extract_channel_data(post_link, page_url):
+def extract_channel_data(post_link, base_url):
     """
-    Extract channel information from the feed card.
-
-    Important:
-
-    The channel <a> is NOT inside the post <a>.
-
-    They are siblings inside the same outer card.
-
-    Therefore we inspect the post link's parent container.
+    The channel link is normally a sibling of the post link
+    inside the same card/container.
     """
 
-    channel_name = None
-    username = None
-    channel_url = None
-    avatar = None
-
-    # --------------------------------------------------------
-    # Find the outer feed card.
-    #
-    # Usually:
-    #
-    # <div class="p-4 sm:p-6 ...">
-    #
-    #   <div>CHANNEL</div>
-    #
-    #   <a href="/feed/...">POST</a>
-    #
-    # </div>
-    #
-    # --------------------------------------------------------
-
-    container = post_link.parent
-
-    if container:
-
-        channel_link = container.find(
-            "a",
-            href=re.compile(r"^/channels/")
-        )
-
-        if channel_link:
-
-            channel_url = absolute_url(
-                channel_link.get("href"),
-                page_url
-            )
-
-            # ------------------------------------------------
-            # Avatar
-            # ------------------------------------------------
-
-            avatar_img = channel_link.find("img")
-
-            if avatar_img:
-
-                avatar = (
-                    avatar_img.get("src")
-                    or avatar_img.get("data-src")
-                )
-
-                if avatar:
-                    avatar = absolute_url(
-                        avatar,
-                        page_url
-                    )
-
-            # ------------------------------------------------
-            # Channel name
-            # ------------------------------------------------
-
-            channel_name_tag = channel_link.find(
-                "p",
-                class_=re.compile(r"font-semibold")
-            )
-
-            if channel_name_tag:
-
-                channel_name = clean_text(
-                    channel_name_tag.get_text(
-                        " ",
-                        strip=True
-                    )
-                )
-
-            # ------------------------------------------------
-            # Username
-            # ------------------------------------------------
-
-            username_tag = channel_link.find(
-                "p",
-                class_=re.compile(r"text-sm")
-            )
-
-            if username_tag:
-
-                username = clean_text(
-                    username_tag.get_text(
-                        " ",
-                        strip=True
-                    )
-                )
-
-                if username:
-                    username = username.lstrip("@")
-
-    return {
-        "name": channel_name,
-        "username": username,
-        "url": channel_url,
-        "avatar": avatar,
+    channel = {
+        "name": None,
+        "username": None,
+        "url": None,
+        "avatar": None,
     }
 
+    parent = post_link.parent
 
-# ============================================================
-# PAGINATION
-# ============================================================
+    if not parent:
+        return channel
 
-def extract_pagination(soup, page_url):
-    """
-    Extract next/previous feed pages.
-    """
-
-    next_page = None
-    previous_page = None
-
-    pagination = soup.find(
-        "nav",
-        attrs={
-            "aria-label": "Pagination navigation"
-        }
+    # Search current container first.
+    candidates = parent.find_all(
+        "a",
+        href=True,
     )
 
-    if not pagination:
-        return {
-            "next": None,
-            "previous": None,
-        }
+    # If not found, search a slightly larger container.
+    if not candidates and parent.parent:
+        candidates = parent.parent.find_all(
+            "a",
+            href=True,
+        )
 
-    for link in pagination.find_all("a"):
+    for link in candidates:
 
         href = link.get("href")
 
         if not href:
             continue
 
-        href = absolute_url(
+        if "/channels/" not in href:
+            continue
+
+        channel["url"] = absolute_url(
             href,
-            page_url
+            base_url,
         )
+
+        text = clean_text(
+            link.get_text(
+                " ",
+                strip=True,
+            )
+        )
+
+        image = link.find("img")
+
+        if image:
+            channel["avatar"] = absolute_url(
+                image.get("src")
+                or image.get("data-src")
+                or image.get("data-lazy-src"),
+                base_url,
+            )
+
+        if text:
+            # Usually:
+            # Channel Name@username
+            if "@" in text:
+                name, username = text.rsplit(
+                    "@",
+                    1,
+                )
+
+                channel["name"] = clean_text(name)
+                channel["username"] = clean_text(
+                    "@" + username
+                )
+            else:
+                channel["name"] = text
+
+        break
+
+    return channel
+
+
+def extract_pagination(soup, base_url):
+    next_url = None
+    previous_url = None
+
+    for link in soup.find_all("a", href=True):
+
+        text = clean_text(
+            link.get_text(
+                " ",
+                strip=True,
+            )
+        )
+
+        href = link.get("href")
 
         if not href:
             continue
 
-        button = link.find("button")
+        href_lower = href.lower()
 
-        aria = (
-            button.get("aria-label", "")
-            if button
-            else ""
-        )
+        if (
+            text
+            and "next" in text.lower()
+        ) or "next" in href_lower:
 
-        aria = aria.strip()
+            next_url = absolute_url(
+                href,
+                base_url,
+            )
 
-        if aria == "Next Page":
-            next_page = href
+        if (
+            text
+            and (
+                "previous" in text.lower()
+                or "prev" in text.lower()
+            )
+        ) or "previous" in href_lower:
 
-        elif aria == "Previous Page":
-            previous_page = href
+            previous_url = absolute_url(
+                href,
+                base_url,
+            )
 
     return {
-        "next": next_page,
-        "previous": previous_page,
+        "next": next_url,
+        "previous": previous_url,
     }
 
 
-# ============================================================
-# PAGE NUMBER
-# ============================================================
-
 def extract_page_number(page_url):
-    """
-    /feed       -> 1
-    /feed/page/2 -> 2
-    /feed/page/25 -> 25
-    """
-
-    if not page_url:
-        return 1
-
     match = re.search(
         r"/feed/page/(\d+)",
-        page_url
+        page_url,
+        re.IGNORECASE,
     )
 
     if match:
@@ -405,251 +296,217 @@ def extract_page_number(page_url):
     return 1
 
 
-# ============================================================
-# MAIN PARSER
-# ============================================================
-
 def parse_page(source_html, page_url):
-    """
-    Parse one Desihub feed page.
-
-    Returns actual feed posts only.
-
-    Example:
-
-        /feed
-        /feed/page/2
-        /feed/page/3
-
-    Each item contains:
-
-        title
-        url
-        channel
-        embed_url
-        video_id
-        video_url
-        thumbnail
-        duration
-    """
-
-    if not source_html:
-        return {
-            "title": None,
-            "page": extract_page_number(page_url),
-            "count": 0,
-            "items": [],
-            "pagination": {
-                "next": None,
-                "previous": None,
-            },
-        }
 
     soup = BeautifulSoup(
         source_html,
-        "html.parser"
+        "html.parser",
     )
 
-    # ========================================================
+    # ---------------------------------------------------------
     # PAGE TITLE
-    # ========================================================
+    # ---------------------------------------------------------
 
-    title_tag = soup.find("title")
+    title = None
 
-    title = clean_text(
-        title_tag.get_text(
-            " ",
-            strip=True
+    if soup.title:
+        title = clean_text(
+            soup.title.get_text(
+                " ",
+                strip=True,
+            )
         )
-        if title_tag
-        else None
-    )
 
-    # ========================================================
-    # NEXT.JS VIDEO DATA
-    # ========================================================
+    # ---------------------------------------------------------
+    # NEXT.JS MEDIA DATA
+    # ---------------------------------------------------------
 
-    video_data = extract_next_video_data(
+    media_data = extract_next_video_data(
         source_html
     )
 
-    # ========================================================
-    # FEED POST LINKS
-    # ========================================================
+    # ---------------------------------------------------------
+    # FEED POSTS
+    # ---------------------------------------------------------
 
-    post_links = soup.find_all(
+    post_links = []
+
+    for link in soup.find_all(
         "a",
-        href=re.compile(
-            r"^/feed/(?!page/)"
-        )
-    )
+        href=True,
+    ):
+
+        href = link.get("href")
+
+        if not href:
+            continue
+
+        # Feed posts:
+        #
+        # /feed/something
+        #
+        # But NOT:
+        #
+        # /feed/page/2
+        #
+
+        if not re.match(
+            r"^/feed/(?!page/)[^/?#]+",
+            href,
+            re.IGNORECASE,
+        ):
+            continue
+
+        post_links.append(link)
+
+    # ---------------------------------------------------------
+    # ITEMS
+    # ---------------------------------------------------------
 
     items = []
-
     seen_urls = set()
 
     for post_link in post_links:
 
         href = post_link.get("href")
 
-        if not href:
-            continue
-
         post_url = absolute_url(
             href,
-            page_url
+            page_url,
         )
 
         if not post_url:
             continue
-
-        # ----------------------------------------------------
-        # Prevent duplicate cards
-        # ----------------------------------------------------
 
         if post_url in seen_urls:
             continue
 
         seen_urls.add(post_url)
 
-        # ====================================================
+        # -----------------------------------------------------
         # TITLE
-        # ====================================================
+        # -----------------------------------------------------
 
         heading = post_link.find("h2")
 
         if heading:
-
-            post_title = clean_text(
+            item_title = clean_text(
                 heading.get_text(
                     " ",
-                    strip=True
+                    strip=True,
                 )
             )
-
         else:
-
-            post_title = clean_text(
+            item_title = clean_text(
                 post_link.get_text(
                     " ",
-                    strip=True
+                    strip=True,
                 )
             )
 
-        if not post_title:
-            continue
+        # -----------------------------------------------------
+        # EMBED
+        # -----------------------------------------------------
 
-        # ====================================================
-        # EMBED URL
-        # ====================================================
-
-        iframe = post_link.find("iframe")
+        iframe = post_link.find(
+            "iframe",
+            src=True,
+        )
 
         embed_url = None
 
         if iframe:
+            embed_url = absolute_url(
+                iframe.get("src"),
+                page_url,
+            )
 
-            embed_url = iframe.get("src")
-
-            if embed_url:
-
-                embed_url = absolute_url(
-                    embed_url,
-                    page_url
-                )
-
-        # ====================================================
+        # -----------------------------------------------------
         # VIDEO ID
-        # ====================================================
+        # -----------------------------------------------------
 
         video_id = extract_video_id(
             embed_url
         )
 
-        # ====================================================
-        # MATCH NEXT.JS VIDEO DATA
-        # ====================================================
+        # -----------------------------------------------------
+        # MEDIA DATA
+        # -----------------------------------------------------
 
-        metadata = (
-            video_data.get(video_id, {})
-            if video_id
-            else {}
-        )
+        media = None
 
-        video_url = metadata.get(
-            "video_url"
-        )
+        if video_id:
+            media = media_data.get(
+                video_id
+            )
 
-        thumbnail = metadata.get(
-            "thumbnail"
-        )
-
-        duration = metadata.get(
-            "duration"
-        )
-
-        # ====================================================
+        # -----------------------------------------------------
         # CHANNEL
-        # ====================================================
+        # -----------------------------------------------------
 
         channel = extract_channel_data(
             post_link,
-            page_url
+            page_url,
         )
 
-        # ====================================================
-        # ITEM
-        # ====================================================
+        # -----------------------------------------------------
+        # FINAL ITEM
+        # -----------------------------------------------------
 
-        item = {
-            "title": post_title,
+        items.append(
+            {
+                "title": item_title,
+                "url": post_url,
+                "channel": channel,
+                "embed_url": embed_url,
+                "video_id": video_id,
+                "video_url": (
+                    media.get("video_url")
+                    if media
+                    else None
+                ),
+                "thumbnail": (
+                    media.get("thumbnail")
+                    if media
+                    else None
+                ),
+                "duration": (
+                    media.get("duration")
+                    if media
+                    else None
+                ),
+            }
+        )
 
-            "url": post_url,
-
-            "channel": channel,
-
-            "embed_url": embed_url,
-
-            "video_id": video_id,
-
-            "video_url": video_url,
-
-            "thumbnail": thumbnail,
-
-            "duration": duration,
-        }
-
-        items.append(item)
-
-    # ========================================================
+    # ---------------------------------------------------------
     # PAGINATION
-    # ========================================================
+    # ---------------------------------------------------------
 
     pagination = extract_pagination(
         soup,
+        page_url,
+    )
+
+    # The site's pagination can be represented
+    # more reliably from the current page number.
+    current_page = extract_page_number(
         page_url
     )
 
-    # ========================================================
-    # PAGE NUMBER
-    # ========================================================
+    if not pagination["previous"] and current_page > 1:
+        pagination["previous"] = (
+            f"{urljoin(page_url, '/feed')}"
+            if current_page == 2
+            else f"{urljoin(page_url, f'/feed/page/{current_page - 1}')}"
+        )
 
-    page_number = extract_page_number(
-        page_url
-    )
-
-    # ========================================================
-    # RESULT
-    # ========================================================
+    if not pagination["next"]:
+        pagination["next"] = None
 
     return {
         "title": title,
-
-        "page": page_number,
-
+        "page": current_page,
         "count": len(items),
-
         "items": items,
-
         "pagination": pagination,
     }
