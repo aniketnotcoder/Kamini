@@ -1477,160 +1477,6 @@ def parse_listing_page(
 # -----------------------------------------------------------------------------
 
 
-
-def _extract_jsonld_graph(html: str) -> List[Dict[str, Any]]:
-    """Extract WebPage/VideoObject dictionaries from JSON-LD on a /post page."""
-    soup = _soup(html)
-    objects: List[Dict[str, Any]] = []
-
-    for script in soup.find_all("script", type="application/ld+json"):
-        raw = script.string or script.get_text()
-        raw = raw.strip() if raw else ""
-        if not raw:
-            continue
-
-        try:
-            decoded = json.loads(raw)
-        except (TypeError, ValueError, json.JSONDecodeError):
-            continue
-
-        values: List[Any]
-        if isinstance(decoded, dict) and isinstance(decoded.get("@graph"), list):
-            values = decoded["@graph"]
-        elif isinstance(decoded, list):
-            values = decoded
-        else:
-            values = [decoded]
-
-        for value in values:
-            if isinstance(value, dict):
-                objects.append(value)
-
-    return objects
-
-
-def _extract_direct_post_jsonld(html: str) -> Dict[str, Any]:
-    """Return normalized metadata/media candidates from a main-site /post JSON-LD block."""
-    graph = _extract_jsonld_graph(html)
-
-    webpage = next(
-        (
-            obj for obj in graph
-            if str(obj.get("@type", "")).lower() == "webpage"
-        ),
-        {},
-    )
-    video = next(
-        (
-            obj for obj in graph
-            if str(obj.get("@type", "")).lower() == "videoobject"
-        ),
-        {},
-    )
-
-    # On the main-site template the VideoObject is commonly nested inside the
-    # WebPage's `video` array rather than emitted as its own @graph node.
-    if not video and isinstance(webpage, dict):
-        nested_videos = webpage.get("video")
-        if isinstance(nested_videos, list):
-            video = next(
-                (
-                    obj for obj in nested_videos
-                    if isinstance(obj, dict)
-                    and str(obj.get("@type", "")).lower() == "videoobject"
-                ),
-                {},
-            )
-        elif isinstance(nested_videos, dict):
-            video = nested_videos
-
-    result: Dict[str, Any] = {}
-
-    # JSON-LD is the authoritative source for the main site's SEO/media metadata.
-    if isinstance(webpage, dict):
-        result["seo_title"] = _clean_string(webpage.get("name"))
-        result["description"] = _clean_string(webpage.get("description"))
-        result["created_at"] = _clean_string(
-            _first_non_empty(webpage.get("datePublished"), webpage.get("dateModified"))
-        )
-        image = webpage.get("image")
-        if isinstance(image, list):
-            image = image[0] if image else None
-        result["thumbnail"] = _clean_string(image)
-
-    if isinstance(video, dict):
-        result["video_name"] = _clean_string(video.get("name"))
-        result["video_description"] = _clean_string(video.get("description"))
-        result["video_url"] = absolute_url(
-            _first_non_empty(video.get("contentUrl"), video.get("contentURL")),
-            "https://desihub.sh",
-        )
-        result["embed_url"] = absolute_url(video.get("embedUrl"), "https://desihub.sh")
-
-        thumbnail = video.get("thumbnailUrl")
-        if isinstance(thumbnail, list):
-            thumbnail = thumbnail[0] if thumbnail else None
-        if thumbnail:
-            result["thumbnail"] = _clean_string(thumbnail)
-
-        duration = _clean_string(video.get("duration"))
-        if duration:
-            result["duration"] = duration
-
-    return {key: value for key, value in result.items() if value is not None}
-
-
-def _merge_direct_post_jsonld_media(
-    feed_object: Dict[str, Any],
-    html: str,
-) -> Dict[str, Any]:
-    """Merge JSON-LD media/metadata into the DOM-derived direct-post object."""
-    data = _extract_direct_post_jsonld(html)
-    if not data:
-        return feed_object
-
-    media_items = feed_object.get("mediaItems")
-    if not isinstance(media_items, list):
-        media_items = []
-
-    if data.get("video_url") or data.get("embed_url"):
-        video_item = {
-            "type": "video",
-            "videoUrl": data.get("video_url"),
-            "embedUrl": data.get("embed_url"),
-            "thumbnail": data.get("thumbnail"),
-            "duration": data.get("duration"),
-        }
-
-        # Keep the DOM iframe identity when present.
-        if media_items:
-            first = media_items[0]
-            if isinstance(first, dict) and first.get("type") == "video":
-                video_item["videoId"] = first.get("videoId") or first.get("id")
-                video_item["id"] = first.get("id")
-                media_items[0] = {
-                    **first,
-                    **{k: v for k, v in video_item.items() if v is not None},
-                }
-            else:
-                media_items.insert(0, video_item)
-        else:
-            media_items.append(video_item)
-
-    feed_object["mediaItems"] = media_items
-
-    # Keep the visible H1 as the public title. JSON-LD enriches the fields
-    # that the rendered post template does not expose directly.
-    for key in ("created_at", "thumbnail", "video_url", "embed_url", "duration"):
-        if data.get(key) is not None:
-            feed_object[key] = data[key]
-
-    if data.get("description") and not feed_object.get("description"):
-        feed_object["description"] = data["description"]
-
-    return feed_object
-
-
 def _decode_next_image_url(value: Any) -> Optional[str]:
     """
     Recover the original image URL from a Next.js optimized image URL.
@@ -1892,7 +1738,6 @@ def _build_dom_post_object(
     requested_slug: str,
     html: str,
     base_url: str,
-    route_hint: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Build a feed-shaped object from the direct post DOM."""
     title = _clean_string(h1.get_text(" ", strip=True)) if h1 is not None else None
@@ -1901,35 +1746,6 @@ def _build_dom_post_object(
 
     media_container = _find_main_post_media_container(h1)
     media = _extract_direct_post_media(media_container, base_url)
-
-    # Feed-post pages render the video's visual/preview image as a separate
-    # DOM block after the iframe. That image is not a second post item. For the
-    # /feed/<slug> family, keep the iframe media only and reconstruct the same
-    # direct MP4 URL the upstream feed objects use.
-    if route_hint == "feed" and media:
-        video_media = [item for item in media if item.get("type") == "video"]
-        if video_media:
-            media = video_media
-            for item in media:
-                video_id = item.get("video_id") or item.get("videoId") or item.get("id")
-                if video_id and not item.get("video_url"):
-                    item["video_url"] = f"https://videos.downloaddirect.xyz/{video_id}.mp4"
-                if video_id and not item.get("thumbnail"):
-                    # The feed template's following image block is the video
-                    # preview. Find the first usable non-hidden image.
-                    if media_container is not None:
-                        for image in media_container.find_all("img"):
-                            aria_hidden = (_clean_string(image.get("aria-hidden")) or "").lower()
-                            alt = _clean_string(image.get("alt"))
-                            classes = image.get("class", [])
-                            if isinstance(classes, str):
-                                classes = classes.split()
-                            if aria_hidden == "true" or "blur-2xl" in " ".join(classes or []).lower():
-                                continue
-                            image_url = _dom_image_source(image)
-                            if image_url:
-                                item["thumbnail"] = image_url
-                                break
 
     # Main-site /post/<slug> pages use a different template: the media is
     # inside the surrounding <article>, not the Feed template's
@@ -1960,9 +1776,7 @@ def _build_dom_post_object(
     if tags:
         feed_object["tags"] = tags
 
-    # Main-site /post pages expose important media metadata in JSON-LD even
-    # when the rendered iframe itself only contains an embed URL.
-    return _merge_direct_post_jsonld_media(feed_object, html)
+    return feed_object
 
 
 def detect_post_route(url: Any) -> Optional[str]:
@@ -1978,7 +1792,7 @@ def detect_post_route(url: Any) -> Optional[str]:
     return None
 
 
-def _find_dom_post_match(html: str, requested_slug: str, base_url: str, route_hint: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def _find_dom_post_match(html: str, requested_slug: str, base_url: str) -> Optional[Dict[str, Any]]:
     """
     Parse the actual direct `/post/<slug>` page.
 
@@ -2006,77 +1820,11 @@ def _find_dom_post_match(html: str, requested_slug: str, base_url: str, route_hi
     if canonical_slug and slug_key(canonical_slug) != slug_key(wanted):
         return None
 
-    feed_object = _build_dom_post_object(h1, wanted, html, base_url, route_hint=route_hint)
+    feed_object = _build_dom_post_object(h1, wanted, html, base_url)
     if feed_object is None:
         return None
 
     return build_public_item(feed_object, base_url)
-
-
-def _extract_dom_post_recommendations(
-    html: str,
-    requested_slug: str,
-    base_url: str,
-) -> List[Dict[str, Any]]:
-    """Extract main-site recommendation cards from the rendered post DOM."""
-    wanted = normalize_slug(requested_slug)
-    soup = _soup(html)
-    results: List[Dict[str, Any]] = []
-    seen: set = set()
-
-    for anchor in soup.find_all("a", href=True):
-        href = _clean_string(anchor.get("href")) or ""
-        if not href.startswith("/post/"):
-            continue
-
-        slug = extract_slug_from_url(absolute_url(href, base_url) or "")
-        slug = normalize_slug(slug)
-        if not slug or slug_key(slug) == slug_key(wanted) or slug_key(slug) in seen:
-            continue
-
-        # Recommendation cards have a visible h3. This prevents ordinary
-        # navigation/post links from becoming recommendations.
-        heading = anchor.find(["h2", "h3", "h4"])
-        if heading is None:
-            continue
-
-        title = _clean_string(heading.get_text(" ", strip=True))
-        if not title:
-            continue
-
-        image = None
-        for img in anchor.find_all("img"):
-            alt = _clean_string(img.get("alt"))
-            if alt and not (_clean_string(img.get("aria-hidden")) or "").lower() == "true":
-                image = _dom_image_source(img)
-                if image:
-                    break
-
-        item = {
-            "title": title,
-            "slug": slug,
-            "url": absolute_url(href, base_url),
-            "type": "unknown",
-            "media_count": 0,
-            "video_count": 0,
-            "image_count": 0,
-            "media": [],
-            "embed_url": None,
-            "video_id": None,
-            "video_url": None,
-            "thumbnail": image,
-            "duration": None,
-            "id": None,
-            "channel_id": None,
-            "channel_name": None,
-            "username": None,
-            "avatar": None,
-            "created_at": None,
-        }
-        results.append(item)
-        seen.add(slug_key(slug))
-
-    return results
 
 
 def extract_post_recommendations(
@@ -2085,12 +1833,16 @@ def extract_post_recommendations(
     base_url: str,
 ) -> List[Dict[str, Any]]:
     """
-    Extract recommendations from both post-page representations.
+    Extract the recommendation cards rendered in the direct post page's
+    ``You might like:`` section.
 
-    Main-site /post pages can render recommendation cards directly in HTML
-    without serializing feed objects into the RSC stream. Feed objects remain
-    the richer source when they are available, so RSC results are preferred and
-    DOM cards fill the gaps.
+    On Desihub's direct post pages the main post is rendered directly in the
+    page component, while recommendation cards are serialized as normal RSC
+    ``feed`` objects.  Therefore the existing RSC feed-object extractor is the
+    correct source for recommendations here.
+
+    The requested post is excluded defensively in case the upstream response
+    ever includes it in its own recommendation list.  Order is preserved.
     """
     wanted = normalize_slug(requested_slug)
     if not html or not wanted:
@@ -2101,25 +1853,20 @@ def extract_post_recommendations(
 
     for feed_object in extract_rsc_feed_objects(html):
         slug = normalize_slug(feed_object.get("slug"))
-        if not slug or slug_key(slug) == slug_key(wanted):
+        if not slug:
             continue
 
-        key = slug_key(slug)
-        if key in seen:
+        if slug_key(slug) == slug_key(wanted):
             continue
 
-        seen.add(key)
-        recommendations.append(build_public_item(feed_object, base_url, route="post"))
-
-    for item in _extract_dom_post_recommendations(html, wanted, base_url):
-        key = slug_key(item.get("slug"))
-        if not key or key in seen:
+        identity = _feed_object_identity(feed_object)
+        if identity in seen:
             continue
-        seen.add(key)
-        recommendations.append(item)
+
+        seen.add(identity)
+        recommendations.append(build_public_item(feed_object, base_url))
 
     return recommendations
-
 
 
 def _attach_post_recommendations(
@@ -2145,14 +1892,14 @@ def parse_post_page(
     base_url: str,
     route_hint: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Parse one individual Desihub post while preserving both post families.
+    """Parse one individual Desihub post from the correct page family.
 
-    /feed/<slug> is kept on the old RSC-first path because that is where the
-    complete feed object contains the video URL, thumbnail, channel metadata,
-    timestamps and rich recommendation objects.
+    Desihub has two different individual-post systems:
+      * /post/<slug> -> main-site post template
+      * /feed/<slug> -> Feed post template
 
-    /post/<slug> uses the direct-post DOM first because its main post is not a
-    normal feed RSC object.
+    The caller may provide route_hint when the source URL is already known.
+    Without it, the parser retains the historical auto-detection behavior.
     """
     wanted = normalize_slug(requested_slug)
     if not wanted:
@@ -2160,68 +1907,32 @@ def parse_post_page(
 
     route = route_hint if route_hint in {"post", "feed"} else None
 
-    # ------------------------------------------------------------------
-    # FEED FAMILY: preserve the old working behaviour.
-    # RSC feed objects are authoritative here.  Do NOT return the DOM
-    # representation first, because it commonly contains only the iframe
-    # embed URL and loses video_url/thumbnail/channel/created_at metadata.
-    # ------------------------------------------------------------------
-    if route == "feed":
-        stream = combined_rsc_payload(html)
-        feed_objects = extract_rsc_feed_objects(html)
-        match = find_feed_object_by_slug(feed_objects, wanted)
-
-        if match is not None:
-            return _attach_post_recommendations(
-                build_public_item(match, base_url, route="feed"),
-                html,
-                wanted,
-                base_url,
-            )
-
-        near_slug_match = _extract_feed_object_near_slug(stream, wanted)
-        if near_slug_match is not None:
-            return _attach_post_recommendations(
-                build_public_item(near_slug_match, base_url, route="feed"),
-                html,
-                wanted,
-                base_url,
-            )
-
-        partial_match = _extract_post_object_from_stream_by_slug(stream, wanted)
-        if partial_match is not None:
-            return _attach_post_recommendations(
-                build_public_item(partial_match, base_url, route="feed"),
-                html,
-                wanted,
-                base_url,
-            )
-
-        # Only if the old RSC path cannot identify the post, fall back to DOM.
-        dom_match = _find_dom_post_match(html, wanted, base_url, route_hint="feed")
+    # Both page families have a rendered H1/media DOM.  The parser's DOM
+    # selectors are template-aware, so use that first for the known family.
+    if route in (None, "post", "feed"):
+        dom_match = _find_dom_post_match(html, wanted, base_url)
         if dom_match is not None:
-            dom_match["url"] = _post_url({"slug": wanted}, base_url, "feed")
+            if route:
+                resolved_route = route
+            else:
+                soup = _soup(html)
+                canonical = soup.find("link", rel=lambda value: value and "canonical" in value)
+                resolved_route = detect_post_route(canonical.get("href") if canonical else None) or "post"
+            dom_match["url"] = _post_url({"slug": wanted}, base_url, resolved_route)
             return _attach_post_recommendations(dom_match, html, wanted, base_url)
 
-        return None
+        if route == "post":
+            return None
 
-    # ------------------------------------------------------------------
-    # /post FAMILY: direct rendered DOM first.  RSC feed objects on this
-    # template are recommendations, not the main post.
-    # ------------------------------------------------------------------
-    dom_match = _find_dom_post_match(html, wanted, base_url, route_hint="post")
-    if dom_match is not None:
-        dom_match["url"] = _post_url({"slug": wanted}, base_url, "post")
-        return _attach_post_recommendations(dom_match, html, wanted, base_url)
-
-    # Secondary recovery for unusual /post revisions.
+    # Feed RSC is the recovery path for Feed pages whose rendered DOM does not
+    # expose enough media information.
     stream = combined_rsc_payload(html)
     feed_objects = extract_rsc_feed_objects(html)
     match = find_feed_object_by_slug(feed_objects, wanted)
 
     if match is not None:
         return _attach_post_recommendations(
-            build_public_item(match, base_url, route="post"),
+            build_public_item(match, base_url, route="feed"),
             html,
             wanted,
             base_url,
@@ -2230,7 +1941,7 @@ def parse_post_page(
     near_slug_match = _extract_feed_object_near_slug(stream, wanted)
     if near_slug_match is not None:
         return _attach_post_recommendations(
-            build_public_item(near_slug_match, base_url, route="post"),
+            build_public_item(near_slug_match, base_url, route="feed"),
             html,
             wanted,
             base_url,
@@ -2239,7 +1950,7 @@ def parse_post_page(
     partial_match = _extract_post_object_from_stream_by_slug(stream, wanted)
     if partial_match is not None:
         return _attach_post_recommendations(
-            build_public_item(partial_match, base_url, route="post"),
+            build_public_item(partial_match, base_url, route="feed"),
             html,
             wanted,
             base_url,
