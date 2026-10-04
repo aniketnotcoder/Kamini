@@ -1351,6 +1351,29 @@ def parse_page(
 
 
 # -----------------------------------------------------------------------------
+# Generic discovery/listing parser
+# -----------------------------------------------------------------------------
+
+
+def parse_listing_page(
+    html: str,
+    base_url: str,
+    current_page: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    Parse a Desihub listing-style page using the same RSC feed-object
+    normalizer as the main feed endpoint.
+
+    This is intentionally generic because tag pages, channel pages, and the
+    search page all render recommendation/listing cards as the same `feed`
+    objects in the Flight payload.
+    """
+    parsed = parse_page(html, base_url, current_page=current_page)
+    parsed["source"] = base_url
+    return parsed
+
+
+# -----------------------------------------------------------------------------
 # Individual post parser
 # -----------------------------------------------------------------------------
 
