@@ -38,6 +38,7 @@ SLUG_CLEAN_PATTERN = re.compile(r"[^a-z0-9]+")
 PAGE_PATH_PATTERN = re.compile(r"/feed/page/(\d+)(?:/)?$", re.IGNORECASE)
 
 GENERIC_PAGE_PATH_PATTERN = re.compile(r"/page/(\d+)(?:/)?$", re.IGNORECASE)
+SEARCH_PAGE_PATH_PATTERN = re.compile(r"/x/[^/]+/(\d+)(?:/)?$", re.IGNORECASE)
 
 MEDIA_TYPES = {"video", "image"}
 
@@ -1399,10 +1400,16 @@ def _extract_listing_card_items(html: str, base_url: str) -> List[Dict[str, Any]
         title = None
         image_url = None
 
+        # Search cards have a real visible <h3> title. Prefer it over the
+        # image alt because the alt text is prefixed with "Featured image for".
+        heading = anchor.find(["h1", "h2", "h3", "h4"])
+        if heading:
+            title = _clean_string(heading.get_text(" ", strip=True))
+
         for image in anchor.find_all("img"):
             alt = _clean_string(image.get("alt"))
-            if alt and not title:
-                title = alt
+            if not title and alt:
+                title = re.sub(r"^featured image for\s*", "", alt, flags=re.IGNORECASE).strip()
             source = _dom_image_source(image)
             if source and not image_url:
                 image_url = source
