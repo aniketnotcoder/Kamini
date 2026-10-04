@@ -345,9 +345,11 @@ def _normalize_page_value(page: int) -> int:
 def _candidate_post_urls(slug: str) -> List[str]:
     """Return both Desihub individual-post families for route discovery."""
     encoded = quote(slug, safe="-")
+    # Preserve the established Feed-post route first.  Newer /post pages are
+    # still supported as the fallback when /feed/<slug> does not exist.
     return [
-        f"{BASE_URL}/post/{encoded}",
         f"{BASE_URL}/feed/{encoded}",
+        f"{BASE_URL}/post/{encoded}",
     ]
 
 
