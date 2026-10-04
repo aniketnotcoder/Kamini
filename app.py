@@ -120,14 +120,15 @@ async def feed_numbered_page(page: int):
             result["html"],
             result["url"],
         )
-
-        return {
-            "source": target_url,
-            "page": page,
-            "status": result["status"],
-            "final_url": result["url"],
-            **parsed,
-        }
+return {
+    "source": target_url,
+    "page": 1,
+    "status": result["status"],
+    "final_url": result["url"],
+    "content_type": result.get("content_type"),
+    "html_length": result.get("html_length"),
+    **parsed,
+}
 
     except Exception as error:
 
