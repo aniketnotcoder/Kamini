@@ -10,6 +10,12 @@ GET /api/health
 GET /api/feed
 GET /api/feed/{page}
 GET /api/post/{slug}
+GET /api/search?q={query}
+GET /api/search?q={query}&page={page}
+GET /api/tag/{tag}
+GET /api/tag/{tag}/{page}
+GET /api/channel/{username}
+GET /api/channel/{username}/{page}
 
 There is intentionally no database/cache layer in this phase.
 """
@@ -17,6 +23,7 @@ There is intentionally no database/cache layer in this phase.
 from __future__ import annotations
 
 from typing import Any, Dict, Optional
+
 from urllib.parse import quote, unquote
 
 from fastapi import FastAPI, HTTPException, Request
@@ -26,12 +33,13 @@ from scraper.parser import (
     extract_page_number_from_url,
     normalize_slug,
     parse_page,
+    parse_listing_page,
     parse_post_page,
     parser_debug_info,
 )
 
 
-APP_VERSION = "0.6.0"
+APP_VERSION = "0.7.0"
 BASE_URL = "https://desihub.sh"
 
 app = FastAPI(
@@ -144,6 +152,142 @@ async def scrape_feed(
     return parsed
 
 
+async def scrape_listing(
+    request: Request,
+    upstream_url: str,
+    page: int = 1,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Fetch and parse a generic Desihub listing page."""
+    try:
+        result = await fetch_page(upstream_url)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to fetch upstream listing: {exc}",
+        ) from exc
+
+    html = result.get("html") or ""
+    if not html:
+        raise HTTPException(
+            status_code=502,
+            detail="Upstream listing returned an empty HTML response.",
+        )
+
+    parsed = parse_listing_page(html, upstream_url, current_page=page)
+
+    api_base = get_public_api_base(request)
+    parsed["pagination"] = _normalize_discovery_pagination(
+        parsed.get("pagination") or {},
+        api_base,
+        route_kind=(extra or {}).get("route_kind"),
+        route_value=(extra or {}).get("route_value"),
+        query=(extra or {}).get("query"),
+    )
+
+    parsed["page"] = page
+    parsed["source"] = upstream_url
+
+    if extra:
+        for key, value in extra.items():
+            if key != "route_kind" and key != "route_value" and key != "query":
+                parsed[key] = value
+
+    return parsed
+
+
+def _build_api_discovery_url(
+    api_base: str,
+    route_kind: str,
+    route_value: str,
+    page: int,
+    query: Optional[str] = None,
+) -> str:
+    """Build a public API URL for discovery pagination."""
+    page = max(1, int(page))
+
+    if route_kind == "search":
+        url = f"{api_base}/api/search?q={quote(query or route_value, safe='')}"
+        if page > 1:
+            url += f"&page={page}"
+        return url
+
+    value = quote(route_value, safe="-")
+    if route_kind == "tag":
+        if page == 1:
+            return f"{api_base}/api/tag/{value}"
+        return f"{api_base}/api/tag/{value}/{page}"
+
+    if route_kind == "channel":
+        if page == 1:
+            return f"{api_base}/api/channel/{value}"
+        return f"{api_base}/api/channel/{value}/{page}"
+
+    return f"{api_base}/api/feed/{page}"
+
+
+def _discovery_page_number(
+    url: Optional[str],
+    route_kind: Optional[str] = None,
+) -> Optional[int]:
+    """Extract a page number from a discovery pagination URL."""
+    if not url:
+        return None
+
+    parsed = urlparse(url)
+    query_page = parsed.query
+    match = re.search(r"(?:^|&)page=(\d+)(?:&|$)", query_page)
+    if match:
+        return int(match.group(1))
+
+    page = extract_page_number_from_url(url)
+    if page is not None:
+        return page
+
+    # Page 1 links often omit `/page/1` entirely.
+    path = parsed.path.rstrip("/")
+    if route_kind == "tag" and "/watch/" in path:
+        return 1
+    if route_kind == "channel" and "/channels/" in path:
+        return 1
+
+    return None
+
+
+def _normalize_discovery_pagination(
+    pagination: Dict[str, Optional[str]],
+    api_base: str,
+    route_kind: Optional[str],
+    route_value: Optional[str],
+    query: Optional[str] = None,
+) -> Dict[str, Optional[str]]:
+    """Convert upstream discovery links into this API's discovery links."""
+    result: Dict[str, Optional[str]] = {"next": None, "previous": None}
+
+    if not route_kind or not route_value:
+        return result
+
+    for key in ("next", "previous"):
+        upstream = pagination.get(key)
+        page = _discovery_page_number(upstream, route_kind)
+        if page is not None:
+            result[key] = _build_api_discovery_url(
+                api_base,
+                route_kind,
+                route_value,
+                page,
+                query=query,
+            )
+
+    return result
+
+
+def _normalize_page_value(page: int) -> int:
+    if page < 1:
+        raise HTTPException(status_code=400, detail="Page must be 1 or greater.")
+    return page
+
+
 @app.get("/")
 async def root() -> Dict[str, Any]:
     return {
@@ -156,6 +300,9 @@ async def root() -> Dict[str, Any]:
             "/api/feed",
             "/api/feed/{page}",
             "/api/post/{slug}",
+            "/api/search?q={query}",
+            "/api/tag/{tag}",
+            "/api/channel/{username}",
         ],
     }
 
@@ -191,6 +338,118 @@ async def feed_page(request: Request, page: int) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail="Page must be 1 or greater.")
 
     return await scrape_feed(request, f"{BASE_URL}/feed/page/{page}", page)
+
+
+@app.get("/api/search")
+async def search(request: Request, q: str, page: int = 1) -> Dict[str, Any]:
+    """Search Desihub through its search page."""
+    page = _normalize_page_value(page)
+    query = unquote(q or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Search query is required.")
+
+    # Desihub exposes its search UI at /x and uses the query string.
+    upstream_url = f"{BASE_URL}/x?q={quote(query, safe='')}"
+    if page > 1:
+        upstream_url += f"&page={page}"
+
+    return await scrape_listing(
+        request,
+        upstream_url,
+        page,
+        {
+            "route_kind": "search",
+            "route_value": query,
+            "query": query,
+            "search_query": query,
+        },
+    )
+
+
+@app.get("/api/tag/{tag}")
+async def tag_page(request: Request, tag: str) -> Dict[str, Any]:
+    """Scrape one Desihub tag page."""
+    clean_tag = unquote(tag or "").strip().strip("/")
+    if not clean_tag:
+        raise HTTPException(status_code=400, detail="Invalid tag.")
+
+    upstream_url = f"{BASE_URL}/watch/{quote(clean_tag, safe='-') }"
+    return await scrape_listing(
+        request,
+        upstream_url,
+        1,
+        {
+            "route_kind": "tag",
+            "route_value": clean_tag,
+            "tag": clean_tag,
+        },
+    )
+
+
+@app.get("/api/tag/{tag}/{page}")
+async def tag_page_number(request: Request, tag: str, page: int) -> Dict[str, Any]:
+    """Scrape a paginated Desihub tag page."""
+    page = _normalize_page_value(page)
+    clean_tag = unquote(tag or "").strip().strip("/")
+    if not clean_tag:
+        raise HTTPException(status_code=400, detail="Invalid tag.")
+
+    upstream_url = f"{BASE_URL}/watch/{quote(clean_tag, safe='-')}/page/{page}"
+    return await scrape_listing(
+        request,
+        upstream_url,
+        page,
+        {
+            "route_kind": "tag",
+            "route_value": clean_tag,
+            "tag": clean_tag,
+        },
+    )
+
+
+@app.get("/api/channel/{username}")
+async def channel_page(request: Request, username: str) -> Dict[str, Any]:
+    """Scrape one Desihub channel page."""
+    clean_username = unquote(username or "").strip().strip("/")
+    if not clean_username:
+        raise HTTPException(status_code=400, detail="Invalid channel username.")
+
+    upstream_url = f"{BASE_URL}/channels/{quote(clean_username, safe='_-') }"
+    return await scrape_listing(
+        request,
+        upstream_url,
+        1,
+        {
+            "route_kind": "channel",
+            "route_value": clean_username,
+            "username": clean_username,
+        },
+    )
+
+
+@app.get("/api/channel/{username}/{page}")
+async def channel_page_number(
+    request: Request,
+    username: str,
+    page: int,
+) -> Dict[str, Any]:
+    """Scrape a paginated Desihub channel page."""
+    page = _normalize_page_value(page)
+    clean_username = unquote(username or "").strip().strip("/")
+    if not clean_username:
+        raise HTTPException(status_code=400, detail="Invalid channel username.")
+
+    upstream_url = f"{BASE_URL}/channels/{quote(clean_username, safe='_-')}/page/{page}"
+    return await scrape_listing(
+        request,
+        upstream_url,
+        page,
+        {
+            "route_kind": "channel",
+            "route_value": clean_username,
+            "username": clean_username,
+        },
+    )
 
 
 @app.get("/api/post/{slug:path}")
