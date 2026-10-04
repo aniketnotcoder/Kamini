@@ -30,7 +30,7 @@ async def health():
 @app.get("/api/scrape")
 async def scrape():
 
-    target = "https://desihub.sh/"
+    target = f"https://desihub.sh/feed/{page}"
 
     result = await fetch_page(target)
 
