@@ -867,11 +867,11 @@ pagination = extract_pagination(
     current_page,
 )
 
+# Page 2+ previous-page fallback.
 
-    # Page 2+ previous-page fallback.
-    if (
-        not pagination["previous"]
-        and current_page > 1
+if (
+    not pagination["previous"]
+    and current_page > 1
     ):
 
         if current_page == 2:
@@ -893,8 +893,7 @@ pagination = extract_pagination(
             )
 
     if not pagination["next"]:
-        pagination["next"] = None
-
+        pagination["next"] = None        
     # ========================================================
     # RESULT
     # ========================================================
