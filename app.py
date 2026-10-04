@@ -658,7 +658,6 @@ async def channel_page_number(
     )
 
 
-@app.get("/api/post/{slug:path}")
 async def _enrich_post_recommendations(
     recommendations: Any,
 ) -> List[Dict[str, Any]]:
@@ -709,6 +708,7 @@ async def _enrich_post_recommendations(
     return await asyncio.gather(*tasks)
 
 
+@app.get("/api/post/{slug:path}")
 async def post_page(request: Request, slug: str) -> Dict[str, Any]:
     """Scrape one individual upstream post page directly."""
     requested_slug = normalize_requested_slug(slug)
