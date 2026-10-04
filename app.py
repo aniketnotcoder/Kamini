@@ -524,17 +524,82 @@ async def health() -> Dict[str, Any]:
 
 @app.get("/api/feed")
 async def feed_page_one(request: Request) -> Dict[str, Any]:
-    """Scrape upstream /feed."""
+    """Scrape upstream /feed exactly as before."""
     return await scrape_feed(request, f"{BASE_URL}/feed", 1)
 
 
 @app.get("/api/feed/{page}")
 async def feed_page(request: Request, page: int) -> Dict[str, Any]:
-    """Scrape upstream /feed/page/N."""
+    """Scrape upstream /feed/page/N.
+
+    This is kept as the original Feed pagination route.
+    """
     if page < 1:
         raise HTTPException(status_code=400, detail="Page must be 1 or greater.")
 
     return await scrape_feed(request, f"{BASE_URL}/feed/page/{page}", page)
+
+
+@app.get("/api/feed/slug/{slug:path}")
+async def feed_post_page(request: Request, slug: str) -> Dict[str, Any]:
+    """Scrape one individual upstream /feed/<slug> page.
+
+    Feed posts intentionally use their own explicit API namespace so a slug
+    can never be mistaken for the integer Feed pagination parameter.
+    """
+    requested_slug = normalize_requested_slug(slug)
+    if not requested_slug:
+        raise HTTPException(status_code=400, detail="Invalid feed post slug.")
+
+    upstream_url = f"{BASE_URL}/feed/{quote(requested_slug, safe='-')}"
+
+    try:
+        result = await fetch_page(upstream_url)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to fetch upstream feed post: {exc}",
+        ) from exc
+
+    html = result.get("html") or ""
+    if not html:
+        raise HTTPException(
+            status_code=502,
+            detail="Upstream feed post returned an empty HTML response.",
+        )
+
+    try:
+        parsed = parse_post_page(
+            html,
+            requested_slug,
+            BASE_URL,
+            route_hint="feed",
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Feed post parser error: {exc}",
+        ) from exc
+
+    if parsed is None:
+        debug = parser_debug_info(html)
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": "Feed post not found.",
+                "requested_slug": requested_slug,
+                "upstream_url": result.get("url") or upstream_url,
+                "html_length": result.get("html_length", len(html)),
+                "rsc_feed_count": debug.get("feed_object_count", 0),
+            },
+        )
+
+    return {
+        **parsed,
+        "source": upstream_url,
+        "post_source": upstream_url,
+        "requested_slug": requested_slug,
+    }
 
 
 @app.get("/api/search")
@@ -659,61 +724,6 @@ async def channel_page_number(
             "username": clean_username,
         },
     )
-
-
-@app.get("/api/feed/{slug:path}")
-async def feed_post_page(request: Request, slug: str) -> Dict[str, Any]:
-    """Scrape one individual upstream /feed/<slug> page only."""
-    requested_slug = normalize_requested_slug(slug)
-    upstream_url = _post_url(requested_slug, "feed")
-
-    try:
-        result = await fetch_page(upstream_url)
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Failed to fetch upstream feed post: {exc}",
-        ) from exc
-
-    html = result.get("html") or ""
-    if not html:
-        raise HTTPException(
-            status_code=502,
-            detail="Upstream feed post returned an empty HTML response.",
-        )
-
-    try:
-        parsed = parse_post_page(
-            html,
-            requested_slug,
-            BASE_URL,
-            route_hint="feed",
-        )
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Feed post parser error: {exc}",
-        ) from exc
-
-    if parsed is None:
-        debug = parser_debug_info(html)
-        raise HTTPException(
-            status_code=404,
-            detail={
-                "message": "Feed post not found.",
-                "requested_slug": requested_slug,
-                "upstream_url": result.get("url") or upstream_url,
-                "html_length": result.get("html_length", len(html)),
-                "rsc_feed_count": debug.get("feed_object_count", 0),
-            },
-        )
-
-    return {
-        **parsed,
-        "source": upstream_url,
-        "post_source": upstream_url,
-        "requested_slug": requested_slug,
-    }
 
 
 @app.get("/api/post/{slug:path}")
