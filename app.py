@@ -24,13 +24,15 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urlparse
+import re
 
 from fastapi import FastAPI, HTTPException, Request
 
 from fetcher import fetch_page
 from scraper.parser import (
     extract_page_number_from_url,
+    extract_generic_page_number_from_url,
     normalize_slug,
     parse_page,
     parse_listing_page,
@@ -39,7 +41,7 @@ from scraper.parser import (
 )
 
 
-APP_VERSION = "0.7.0"
+APP_VERSION = "0.8.0"
 BASE_URL = "https://desihub.sh"
 
 app = FastAPI(
@@ -244,11 +246,17 @@ def _discovery_page_number(
     if page is not None:
         return page
 
+    page = extract_generic_page_number_from_url(url)
+    if page is not None:
+        return page
+
     # Page 1 links often omit `/page/1` entirely.
     path = parsed.path.rstrip("/")
     if route_kind == "tag" and "/watch/" in path:
         return 1
     if route_kind == "channel" and "/channels/" in path:
+        return 1
+    if route_kind == "search" and re.search(r"/x/[^/]+/?$", path):
         return 1
 
     return None
@@ -348,10 +356,12 @@ async def search(request: Request, q: str, page: int = 1) -> Dict[str, Any]:
     if not query:
         raise HTTPException(status_code=400, detail="Search query is required.")
 
-    # Desihub exposes its search UI at /x and uses the query string.
-    upstream_url = f"{BASE_URL}/x?q={quote(query, safe='')}"
+    # Desihub search is path-based: /x/<query>.
+    # Pagination follows the same listing convention: /x/<query>/page/N.
+    encoded_query = quote(query, safe="-")
+    upstream_url = f"{BASE_URL}/x/{encoded_query}"
     if page > 1:
-        upstream_url += f"&page={page}"
+        upstream_url += f"/page/{page}"
 
     return await scrape_listing(
         request,
