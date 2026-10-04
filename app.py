@@ -33,6 +33,7 @@ from fetcher import fetch_page
 from scraper.parser import (
     extract_generic_page_number_from_url,
     extract_page_number_from_url,
+    detect_post_route,
     normalize_slug,
     parse_listing_page,
     parse_page,
@@ -349,13 +350,22 @@ def _post_url(slug: str, route: str) -> str:
     return f"{BASE_URL}/post/{encoded}"
 
 
-def _candidate_post_urls(slug: str) -> List[str]:
-    """Legacy search enrichment candidates; public post routes do not use this."""
+def _candidate_post_urls(item: Dict[str, Any], slug: str) -> List[Tuple[str, str]]:
+    """Choose the exact upstream post family represented by a listing card."""
     encoded = quote(slug, safe="-")
-    return [
-        f"{BASE_URL}/post/{encoded}",
-        f"{BASE_URL}/feed/{encoded}",
-    ]
+    route = detect_post_route(item.get("url")) or detect_post_route(item.get("source"))
+
+    # Search cards on Desihub use /post/<slug>.
+    if route == "post":
+        return [("post", f"{BASE_URL}/post/{encoded}")]
+
+    # Feed/channel cards use /feed/<slug>.
+    if route == "feed":
+        return [("feed", f"{BASE_URL}/feed/{encoded}")]
+
+    # Unknown listing shape: prefer /post because this resolver is used by
+    # search enrichment, while explicit Feed cards are handled above.
+    return [("post", f"{BASE_URL}/post/{encoded}")]
 
 
 async def _resolve_search_item(
@@ -376,7 +386,7 @@ async def _resolve_search_item(
     async with semaphore:
         errors: List[str] = []
 
-        for target_url in _candidate_post_urls(slug):
+        for route_hint, target_url in _candidate_post_urls(item, slug):
             try:
                 result = await fetch_page(target_url)
             except Exception as exc:
@@ -389,7 +399,7 @@ async def _resolve_search_item(
                 continue
 
             try:
-                parsed = parse_post_page(html, slug, BASE_URL)
+                parsed = parse_post_page(html, slug, BASE_URL, route_hint=route_hint)
             except Exception as exc:
                 errors.append(f"{target_url}: parser error: {exc}")
                 continue
@@ -412,20 +422,8 @@ async def _resolve_search_item(
             if not merged.get("thumbnail") and item.get("thumbnail"):
                 merged["thumbnail"] = item.get("thumbnail")
 
-            # Do not stop at the first 200 response.  Desihub currently has
-            # two post URL shapes in circulation:
-            #   /post/<slug>
-            #   /feed/<slug>
-            #
-            # A /post/<slug> response can be a valid HTML page but still be
-            # parsed as `unknown` when that route variant does not contain the
-            # direct-post media wrapper.  In that case we MUST continue to the
-            # /feed/<slug> fallback instead of returning the empty card.
-            #
-            # For search enrichment, a real media-bearing parse is the useful
-            # success condition.  If the parser identified the post but found
-            # no media, keep it only as a fallback candidate and continue trying
-            # the other route first.
+            # Only accept a media-bearing result for enrichment.  The route is
+            # already fixed by the source card, so there is no cross-route fallback.
             parsed_media_count = parsed.get("media_count")
             parsed_type = parsed.get("type")
             if parsed_type != "unknown" or (
