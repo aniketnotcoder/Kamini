@@ -34,6 +34,7 @@ from scraper.parser import (
     extract_generic_page_number_from_url,
     extract_page_number_from_url,
     normalize_slug,
+    parse_feed_post_page,
     parse_listing_page,
     parse_page,
     parse_post_page,
@@ -569,11 +570,10 @@ async def feed_post_page(request: Request, slug: str) -> Dict[str, Any]:
         )
 
     try:
-        parsed = parse_post_page(
+        parsed = parse_feed_post_page(
             html,
             requested_slug,
             BASE_URL,
-            route_hint="feed",
         )
     except Exception as exc:
         raise HTTPException(
