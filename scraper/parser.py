@@ -555,54 +555,74 @@ def extract_channel_data(post_link, base_url):
 # PAGINATION
 # ============================================================
 
-def extract_pagination(soup, base_url):
+def extract_pagination(soup, base_url, current_page):
 
     next_url = None
     previous_url = None
+
+    # --------------------------------------------------------
+    # Previous page
+    # --------------------------------------------------------
+
+    if current_page > 1:
+
+        if current_page == 2:
+            previous_url = urljoin(
+                base_url,
+                "/feed",
+            )
+
+        else:
+            previous_url = urljoin(
+                base_url,
+                f"/feed/page/{current_page - 1}",
+            )
+
+    # --------------------------------------------------------
+    # Next page
+    # --------------------------------------------------------
+
+    # Look for an actual numbered feed page link.
+    # If page N+1 exists, use it.
+    expected_next = (
+        "/feed"
+        if current_page == 1
+        else f"/feed/page/{current_page + 1}"
+    )
 
     for link in soup.find_all(
         "a",
         href=True,
     ):
 
-        text = clean_text(
-            link.get_text(
-                " ",
-                strip=True,
-            )
-        )
-
         href = link.get("href")
 
         if not href:
             continue
 
-        href_lower = href.lower()
+        parsed_href = urlparse(href)
 
-        # Next page
-        if (
-            text
-            and "next" in text.lower()
-        ) or "next" in href_lower:
+        path = parsed_href.path.rstrip("/")
 
-            next_url = absolute_url(
-                href,
-                base_url,
-            )
+        # Page 1 -> /feed/page/2
+        if current_page == 1:
 
-        # Previous page
-        if (
-            text
-            and (
-                "previous" in text.lower()
-                or "prev" in text.lower()
-            )
-        ) or "previous" in href_lower:
+            if path == "/feed/page/2":
+                next_url = absolute_url(
+                    href,
+                    base_url,
+                )
+                break
 
-            previous_url = absolute_url(
-                href,
-                base_url,
-            )
+        # Page 2+ -> /feed/page/N+1
+        else:
+
+            if path == expected_next:
+                next_url = absolute_url(
+                    href,
+                    base_url,
+                )
+                break
 
     return {
         "next": next_url,
@@ -628,8 +648,6 @@ def extract_page_number(page_url):
         )
 
     return 1
-
-
 # ============================================================
 # MAIN PAGE PARSER
 # ============================================================
@@ -842,6 +860,7 @@ def parse_page(source_html, page_url):
     pagination = extract_pagination(
         soup,
         page_url,
+        current_page,
     )
 
     current_page = extract_page_number(
