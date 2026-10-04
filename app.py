@@ -22,33 +22,46 @@ There is intentionally no database/cache layer in this phase.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
-
-from urllib.parse import quote, unquote, urlparse
+import asyncio
 import re
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote, unquote, urlparse
 
 from fastapi import FastAPI, HTTPException, Request
 
 from fetcher import fetch_page
 from scraper.parser import (
-    extract_page_number_from_url,
     extract_generic_page_number_from_url,
+    extract_page_number_from_url,
     normalize_slug,
-    parse_page,
     parse_listing_page,
+    parse_page,
     parse_post_page,
     parser_debug_info,
 )
 
 
-APP_VERSION = "0.8.1"
+APP_VERSION = "0.9.0"
 BASE_URL = "https://desihub.sh"
+
+# Search enrichment intentionally uses a small concurrency limit.  A search
+# page normally contains 12 cards, so this avoids turning one API request into
+# a burst of 12+ simultaneous upstream requests.
+SEARCH_ENRICH_CONCURRENCY = 4
 
 app = FastAPI(
     title="Desihub Scraper API",
     version=APP_VERSION,
-    description="Stateless Desihub feed/post scraper using rendered HTML and Next.js RSC data.",
+    description=(
+        "Stateless Desihub feed/post scraper using rendered HTML and "
+        "Next.js RSC data."
+    ),
 )
+
+
+# -----------------------------------------------------------------------------
+# Public API URL helpers
+# -----------------------------------------------------------------------------
 
 
 def get_public_api_base(request: Request) -> str:
@@ -102,12 +115,20 @@ def _normalize_public_pagination(
     return result
 
 
+# -----------------------------------------------------------------------------
+# Slug helpers
+# -----------------------------------------------------------------------------
+
+
 def normalize_requested_slug(value: str) -> str:
     """Normalize a route slug without accepting an empty value."""
     value = unquote(value or "").strip()
 
     if "/feed/" in value:
         value = value.split("/feed/", 1)[1]
+
+    if "/post/" in value:
+        value = value.split("/post/", 1)[1]
 
     value = value.strip("/")
     slug = normalize_slug(value)
@@ -116,6 +137,11 @@ def normalize_requested_slug(value: str) -> str:
         raise HTTPException(status_code=400, detail="Invalid post slug.")
 
     return slug
+
+
+# -----------------------------------------------------------------------------
+# Feed scraping
+# -----------------------------------------------------------------------------
 
 
 async def scrape_feed(
@@ -152,6 +178,11 @@ async def scrape_feed(
     parsed["source"] = upstream_url
 
     return parsed
+
+
+# -----------------------------------------------------------------------------
+# Generic listing scraping
+# -----------------------------------------------------------------------------
 
 
 async def scrape_listing(
@@ -192,10 +223,15 @@ async def scrape_listing(
 
     if extra:
         for key, value in extra.items():
-            if key != "route_kind" and key != "route_value" and key != "query":
+            if key not in {"route_kind", "route_value", "query"}:
                 parsed[key] = value
 
     return parsed
+
+
+# -----------------------------------------------------------------------------
+# Discovery pagination helpers
+# -----------------------------------------------------------------------------
 
 
 def _build_api_discovery_url(
@@ -300,6 +336,118 @@ def _normalize_page_value(page: int) -> int:
     return page
 
 
+# -----------------------------------------------------------------------------
+# Search post enrichment
+# -----------------------------------------------------------------------------
+
+
+def _candidate_post_urls(slug: str) -> List[str]:
+    """
+    Return upstream post routes in preferred order.
+
+    Search result cards currently expose `/post/<slug>`, while the direct-post
+    route used by the earlier captured post page is `/feed/<slug>`.
+    We therefore support both instead of assuming one route globally.
+    """
+    encoded = quote(slug, safe="-")
+    return [
+        f"{BASE_URL}/post/{encoded}",
+        f"{BASE_URL}/feed/{encoded}",
+    ]
+
+
+async def _resolve_search_item(
+    item: Dict[str, Any],
+    semaphore: asyncio.Semaphore,
+) -> Dict[str, Any]:
+    """
+    Resolve one search card into a full public post item.
+
+    Search pages intentionally contain lightweight cards.  Their `media` array
+    is not necessarily present there, so each card is resolved against its
+    actual post page.  The first successful parser result wins.
+    """
+    slug = normalize_slug(item.get("slug"))
+    if not slug:
+        return item
+
+    async with semaphore:
+        errors: List[str] = []
+
+        for target_url in _candidate_post_urls(slug):
+            try:
+                result = await fetch_page(target_url)
+            except Exception as exc:
+                errors.append(f"{target_url}: {exc}")
+                continue
+
+            html = result.get("html") or ""
+            if not html:
+                errors.append(f"{target_url}: empty response")
+                continue
+
+            try:
+                parsed = parse_post_page(html, slug, BASE_URL)
+            except Exception as exc:
+                errors.append(f"{target_url}: parser error: {exc}")
+                continue
+
+            if parsed is None:
+                errors.append(f"{target_url}: post parser returned no match")
+                continue
+
+            # Keep the search-card thumbnail if the direct page has no first
+            # video thumbnail, but prefer all richer post data from the parser.
+            merged = dict(item)
+            merged.update(parsed)
+
+            # Search cards use /post/<slug>; expose the exact route that was
+            # successfully resolved instead of silently changing it to /feed.
+            merged["url"] = target_url
+            merged["post_source"] = target_url
+            merged["slug"] = slug
+
+            if not merged.get("thumbnail") and item.get("thumbnail"):
+                merged["thumbnail"] = item.get("thumbnail")
+
+            # A successful parse is enough even if the post legitimately has
+            # zero media.  `type: unknown` is only a failure signal when the
+            # direct parser could not identify the post at all.
+            merged.pop("post_resolve_error", None)
+            return merged
+
+        # Do not delete the search result if an individual post fails.  Keep the
+        # original card and expose a small diagnostic so the caller knows why
+        # it remained un-enriched.
+        failed = dict(item)
+        if errors:
+            failed["post_resolve_error"] = errors[-1]
+        return failed
+
+
+async def enrich_search_results(items: Any) -> List[Dict[str, Any]]:
+    """Enrich all search cards concurrently while preserving their order."""
+    if not isinstance(items, list) or not items:
+        return []
+
+    semaphore = asyncio.Semaphore(SEARCH_ENRICH_CONCURRENCY)
+
+    tasks = [
+        _resolve_search_item(item, semaphore)
+        if isinstance(item, dict)
+        else _resolve_search_item({}, semaphore)
+        for item in items
+    ]
+
+    results = await asyncio.gather(*tasks, return_exceptions=False)
+    return results
+
+
+# -----------------------------------------------------------------------------
+# Routes
+# -----------------------------------------------------------------------------
+
+
 @app.get("/")
 async def root() -> Dict[str, Any]:
     return {
@@ -329,6 +477,8 @@ async def api_info() -> Dict[str, Any]:
         "database": False,
         "cache": False,
         "parser": "html + Next.js RSC/Flight",
+        "search_enrichment": True,
+        "search_enrichment_concurrency": SEARCH_ENRICH_CONCURRENCY,
     }
 
 
@@ -354,21 +504,22 @@ async def feed_page(request: Request, page: int) -> Dict[str, Any]:
 
 @app.get("/api/search")
 async def search(request: Request, q: str, page: int = 1) -> Dict[str, Any]:
-    """Search Desihub through its search page."""
+    """Search Desihub and enrich every discovered post with its full media."""
     page = _normalize_page_value(page)
     query = unquote(q or "").strip()
     if not query:
         raise HTTPException(status_code=400, detail="Search query is required.")
 
-    # Desihub search is path-based: /x/<query>.
-    # IMPORTANT: search pagination is /x/<query>/2, /x/<query>/3, ...
-    # (not /page/N). This is confirmed by the captured search page.
+    # Desihub search is path-based:
+    #   /x/<query>
+    #   /x/<query>/2
+    #   /x/<query>/3
     encoded_query = quote(query, safe="-")
     upstream_url = f"{BASE_URL}/x/{encoded_query}"
     if page > 1:
         upstream_url += f"/{page}"
 
-    return await scrape_listing(
+    parsed = await scrape_listing(
         request,
         upstream_url,
         page,
@@ -380,6 +531,14 @@ async def search(request: Request, q: str, page: int = 1) -> Dict[str, Any]:
         },
     )
 
+    # IMPORTANT: this is the missing Phase-5 step that the broken response
+    # demonstrated.  Search card extraction alone only gives title/slug/
+    # thumbnail.  Resolve each actual post page before returning the response.
+    parsed["items"] = await enrich_search_results(parsed.get("items") or [])
+    parsed["count"] = len(parsed["items"])
+
+    return parsed
+
 
 @app.get("/api/tag/{tag}")
 async def tag_page(request: Request, tag: str) -> Dict[str, Any]:
@@ -388,7 +547,7 @@ async def tag_page(request: Request, tag: str) -> Dict[str, Any]:
     if not clean_tag:
         raise HTTPException(status_code=400, detail="Invalid tag.")
 
-    upstream_url = f"{BASE_URL}/watch/{quote(clean_tag, safe='-') }"
+    upstream_url = f"{BASE_URL}/watch/{quote(clean_tag, safe='-')}"
     return await scrape_listing(
         request,
         upstream_url,
@@ -429,7 +588,7 @@ async def channel_page(request: Request, username: str) -> Dict[str, Any]:
     if not clean_username:
         raise HTTPException(status_code=400, detail="Invalid channel username.")
 
-    upstream_url = f"{BASE_URL}/channels/{quote(clean_username, safe='_-') }"
+    upstream_url = f"{BASE_URL}/channels/{quote(clean_username, safe='_-')}"
     return await scrape_listing(
         request,
         upstream_url,
@@ -469,48 +628,71 @@ async def channel_page_number(
 
 @app.get("/api/post/{slug:path}")
 async def post_page(request: Request, slug: str) -> Dict[str, Any]:
-    """Scrape one individual upstream /feed/<slug> page directly."""
+    """Scrape one individual upstream post page directly."""
     requested_slug = normalize_requested_slug(slug)
-    encoded_slug = quote(requested_slug, safe="-")
-    target_url = f"{BASE_URL}/feed/{encoded_slug}"
 
+    # Keep the established direct-post route first.  If the upstream exposes
+    # the same post through /post/<slug>, use it as a fallback.
+    candidates = _candidate_post_urls(requested_slug)
+
+    errors: List[str] = []
+
+    for target_url in candidates:
+        try:
+            result = await fetch_page(target_url)
+        except Exception as exc:
+            errors.append(f"{target_url}: {exc}")
+            continue
+
+        html = result.get("html") or ""
+        if not html:
+            errors.append(f"{target_url}: empty response")
+            continue
+
+        try:
+            parsed = parse_post_page(html, requested_slug, BASE_URL)
+        except Exception as exc:
+            errors.append(f"{target_url}: parser error: {exc}")
+            continue
+
+        if parsed is not None:
+            return {
+                **parsed,
+                "source": target_url,
+                "post_source": target_url,
+                "requested_slug": requested_slug,
+            }
+
+        errors.append(f"{target_url}: post parser returned no match")
+
+    # Use the last/most useful fetch diagnostics when all candidates fail.
+    target_url = candidates[0]
     try:
         result = await fetch_page(target_url)
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Failed to fetch upstream post: {exc}",
-        ) from exc
+        html = result.get("html") or ""
+        debug = parser_debug_info(html) if html else {}
+        upstream_status = result.get("status")
+        upstream_url = result.get("url") or target_url
+        html_length = result.get("html_length", len(html))
+    except Exception:
+        debug = {}
+        upstream_status = None
+        upstream_url = target_url
+        html_length = 0
 
-    html = result.get("html") or ""
-
-    if not html:
-        raise HTTPException(
-            status_code=502,
-            detail="Upstream post returned an empty HTML response.",
-        )
-
-    parsed = parse_post_page(html, requested_slug, BASE_URL)
-
-    if parsed is None:
-        debug = parser_debug_info(html)
-        raise HTTPException(
-            status_code=404,
-            detail={
-                "message": "Post not found.",
-                "requested_slug": requested_slug,
-                "upstream_status": result.get("status"),
-                "upstream_url": result.get("url") or target_url,
-                "html_length": result.get("html_length", len(html)),
-                "rsc_feed_count": debug.get("feed_object_count", 0),
-            },
-        )
-
-    return {
-        **parsed,
-        "source": target_url,
-        "requested_slug": requested_slug,
-    }
+    raise HTTPException(
+        status_code=404,
+        detail={
+            "message": "Post not found.",
+            "requested_slug": requested_slug,
+            "upstream_status": upstream_status,
+            "upstream_url": upstream_url,
+            "html_length": html_length,
+            "rsc_feed_count": debug.get("feed_object_count", 0),
+            "attempts": candidates,
+            "errors": errors[-4:],
+        },
+    )
 
 
 if __name__ == "__main__":
