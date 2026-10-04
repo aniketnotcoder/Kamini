@@ -1,391 +1,250 @@
+"""
+Desihub scraper API.
+
+FastAPI wrapper around the stateless HTML/RSC parser.
+
+Endpoints
+---------
+GET /api
+GET /api/health
+GET /api/feed
+GET /api/feed/{page}
+GET /api/post/{slug}
+
+There is intentionally no database/cache layer in this phase.
+"""
+
 from __future__ import annotations
 
-from urllib.parse import quote, urlparse, unquote
+from typing import Any, Dict, Optional
+from urllib.parse import quote, unquote
 
 from fastapi import FastAPI, HTTPException, Request
 
-from scraper.fetcher import fetch_page
+from fetcher import fetch_page
 from scraper.parser import (
+    extract_page_number_from_url,
+    normalize_slug,
     parse_page,
     parse_post_page,
+    parser_debug_info,
 )
 
 
-app = FastAPI(
-    title="Kamini Scraper API",
-    description="Parser API for Desihub feed pages and individual posts",
-    version="0.5.0",
-)
-
-
+APP_VERSION = "0.5.2"
 BASE_URL = "https://desihub.sh"
 
-
-# ---------------------------------------------------------------------------
-# Public API URL helpers
-# ---------------------------------------------------------------------------
-
-def get_public_api_base(
-    request: Request,
-) -> str:
-    """
-    Build the public base URL from the incoming request.
-
-    Example:
-        https://kamini-ivory.vercel.app
-
-    This lets pagination links point back to our API instead of exposing
-    upstream Desihub URLs.
-    """
-
-    forwarded_proto = request.headers.get(
-        "x-forwarded-proto"
-    )
-
-    forwarded_host = request.headers.get(
-        "x-forwarded-host"
-    )
-
-    host = (
-        forwarded_host
-        or request.headers.get("host")
-    )
-
-    if not host:
-        return str(
-            request.base_url
-        ).rstrip("/")
-
-    proto = (
-        forwarded_proto.split(",")[0].strip()
-        if forwarded_proto
-        else request.url.scheme
-    )
-
-    return f"{proto}://{host}".rstrip("/")
+app = FastAPI(
+    title="Desihub Scraper API",
+    version=APP_VERSION,
+    description="Stateless Desihub feed/post scraper using rendered HTML and Next.js RSC data.",
+)
 
 
-def _extract_feed_page_number(
-    path: str,
-) -> int | None:
-    """
-    Convert an upstream pagination path to a feed page number.
+def get_public_api_base(request: Request) -> str:
+    """Return the public base URL of this API."""
+    forwarded_proto = request.headers.get("x-forwarded-proto")
+    forwarded_host = request.headers.get("x-forwarded-host")
 
-    /feed          -> 1
-    /feed/page/2   -> 2
-    """
+    if forwarded_host:
+        scheme = forwarded_proto or request.url.scheme
+        return f"{scheme}://{forwarded_host}".rstrip("/")
 
-    parsed = urlparse(path)
+    return str(request.base_url).rstrip("/")
 
-    path = parsed.path.rstrip("/")
 
-    if path == "/feed":
-        return 1
+def _build_api_feed_url(api_base: str, page: int) -> str:
+    """Build this API's feed URL for a page number."""
+    page = max(1, int(page))
+    if page == 1:
+        return f"{api_base}/api/feed"
+    return f"{api_base}/api/feed/{page}"
 
-    prefix = "/feed/page/"
 
-    if not path.startswith(prefix):
+def _upstream_page_number(url: Optional[str]) -> Optional[int]:
+    """Return the page number represented by an upstream pagination URL."""
+    if not url:
         return None
 
-    value = path[len(prefix):]
-
-    try:
-        page = int(value)
-    except ValueError:
-        return None
-
-    if page < 1:
+    page = extract_page_number_from_url(url)
+    if page is None:
+        cleaned = url.rstrip("/")
+        if cleaned.endswith("/feed"):
+            return 1
         return None
 
     return page
 
 
-def _build_api_feed_url(
-    api_base_url: str,
-    page: int,
-) -> str:
-    if page <= 1:
-        return (
-            f"{api_base_url}/api/feed"
-        )
-
-    return (
-        f"{api_base_url}/api/feed/{page}"
-    )
-
-
 def _normalize_public_pagination(
-    pagination: dict,
-    api_base_url: str,
-) -> dict:
-    """
-    Convert parser-level upstream paths into public API URLs.
+    pagination: Dict[str, Optional[str]],
+    api_base: str,
+) -> Dict[str, Optional[str]]:
+    """Convert upstream /feed/page/N links into API /api/feed/N links."""
+    result: Dict[str, Optional[str]] = {"next": None, "previous": None}
 
-    Parser:
-        /feed/page/7
-
-    Public API:
-        https://kamini-ivory.vercel.app/api/feed/7
-    """
-
-    result = {
-        "next": None,
-        "previous": None,
-    }
-
-    if not isinstance(
-        pagination,
-        dict,
-    ):
-        return result
-
-    for direction in (
-        "next",
-        "previous",
-    ):
-        path = pagination.get(
-            direction
-        )
-
-        if not path:
-            continue
-
-        page = _extract_feed_page_number(
-            path
-        )
-
-        if page is None:
-            continue
-
-        result[direction] = (
-            _build_api_feed_url(
-                api_base_url,
-                page,
-            )
-        )
+    for key in ("next", "previous"):
+        upstream = pagination.get(key)
+        page = _upstream_page_number(upstream)
+        if page is not None:
+            result[key] = _build_api_feed_url(api_base, page)
 
     return result
 
 
-# ---------------------------------------------------------------------------
-# Basic endpoints
-# ---------------------------------------------------------------------------
+def normalize_requested_slug(value: str) -> str:
+    """Normalize a route slug without accepting an empty value."""
+    value = unquote(value or "").strip()
+
+    if "/feed/" in value:
+        value = value.split("/feed/", 1)[1]
+
+    value = value.strip("/")
+    slug = normalize_slug(value)
+
+    if not slug:
+        raise HTTPException(status_code=400, detail="Invalid post slug.")
+
+    return slug
+
+
+async def scrape_feed(
+    request: Request,
+    upstream_url: str,
+    page: int,
+) -> Dict[str, Any]:
+    """Fetch and parse one upstream feed page."""
+    try:
+        result = await fetch_page(upstream_url)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to fetch upstream feed: {exc}",
+        ) from exc
+
+    html = result.get("html") or ""
+
+    if not html:
+        raise HTTPException(
+            status_code=502,
+            detail="Upstream feed returned an empty HTML response.",
+        )
+
+    parsed = parse_page(html, BASE_URL, current_page=page)
+
+    api_base = get_public_api_base(request)
+    parsed["pagination"] = _normalize_public_pagination(
+        parsed.get("pagination") or {},
+        api_base,
+    )
+
+    parsed["page"] = page
+    parsed["source"] = upstream_url
+
+    return parsed
+
 
 @app.get("/")
-async def root():
+async def root() -> Dict[str, Any]:
     return {
+        "name": "Desihub Scraper API",
+        "version": APP_VERSION,
         "status": "ok",
-        "service": "kamini-scraper",
-        "version": "0.5.0",
+        "endpoints": [
+            "/api",
+            "/api/health",
+            "/api/feed",
+            "/api/feed/{page}",
+            "/api/post/{slug}",
+        ],
     }
 
 
 @app.get("/api")
-async def api_root():
+async def api_info() -> Dict[str, Any]:
     return {
+        "name": "Desihub Scraper API",
+        "version": APP_VERSION,
         "status": "ok",
-        "service": "kamini-scraper",
-        "version": "0.5.0",
+        "upstream": BASE_URL,
+        "database": False,
+        "cache": False,
+        "parser": "html + Next.js RSC/Flight",
     }
 
 
 @app.get("/api/health")
-async def health():
-    return {
-        "status": "ok",
-        "service": "kamini-scraper",
-        "status_code": 200,
-    }
+async def health() -> Dict[str, Any]:
+    return {"status": "ok", "version": APP_VERSION}
 
-
-# ---------------------------------------------------------------------------
-# Shared feed scraper
-# ---------------------------------------------------------------------------
-
-async def scrape_feed(
-    target_url: str,
-    requested_page: int,
-    api_base_url: str,
-):
-    try:
-        result = await fetch_page(
-            target_url
-        )
-
-        parsed = parse_page(
-            result["html"],
-            result["url"],
-        )
-
-        parsed["pagination"] = (
-            _normalize_public_pagination(
-                parsed.get(
-                    "pagination",
-                    {},
-                ),
-                api_base_url,
-            )
-        )
-
-        return {
-            "source": target_url,
-            "page": requested_page,
-            "status": result["status"],
-            "final_url": result["url"],
-            "content_type": result.get(
-                "content_type"
-            ),
-            "html_length": result.get(
-                "html_length"
-            ),
-            **parsed,
-        }
-
-    except HTTPException:
-        raise
-
-    except Exception as error:
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Scraping failed: "
-                f"{type(error).__name__}: "
-                f"{str(error)}"
-            ),
-        )
-
-
-# ---------------------------------------------------------------------------
-# Feed endpoints
-# ---------------------------------------------------------------------------
 
 @app.get("/api/feed")
-async def feed_first_page(
-    request: Request,
-):
-    api_base_url = get_public_api_base(
-        request
-    )
-
-    return await scrape_feed(
-        f"{BASE_URL}/feed",
-        1,
-        api_base_url,
-    )
+async def feed_page_one(request: Request) -> Dict[str, Any]:
+    """Scrape upstream /feed."""
+    return await scrape_feed(request, f"{BASE_URL}/feed", 1)
 
 
 @app.get("/api/feed/{page}")
-async def feed_numbered_page(
-    page: int,
-    request: Request,
-):
+async def feed_page(request: Request, page: int) -> Dict[str, Any]:
+    """Scrape upstream /feed/page/N."""
     if page < 1:
-        raise HTTPException(
-            status_code=400,
-            detail="Page must be 1 or greater.",
-        )
+        raise HTTPException(status_code=400, detail="Page must be 1 or greater.")
 
-    if page == 1:
-        target_url = (
-            f"{BASE_URL}/feed"
-        )
-    else:
-        target_url = (
-            f"{BASE_URL}/feed/page/{page}"
-        )
-
-    api_base_url = get_public_api_base(
-        request
-    )
-
-    return await scrape_feed(
-        target_url,
-        page,
-        api_base_url,
-    )
+    return await scrape_feed(request, f"{BASE_URL}/feed/page/{page}", page)
 
 
-# ---------------------------------------------------------------------------
-# Individual post endpoint
-# ---------------------------------------------------------------------------
-
-def normalize_requested_slug(
-    slug: str,
-) -> str:
-    """
-    Normalize the route parameter without changing the actual slug.
-    """
-
-    value = unquote(
-        str(slug or "")
-    ).strip()
-
-    value = value.strip("/")
-
-    if value.startswith("feed/"):
-        value = value[5:]
-
-    return value
-
-
-@app.get("/api/post/{slug}")
-async def post_by_slug(
-    slug: str,
-):
-    requested_slug = normalize_requested_slug(
-        slug
-    )
-
-    if not requested_slug:
-        raise HTTPException(
-            status_code=400,
-            detail="A valid post slug is required.",
-        )
-
-    target_url = (
-        f"{BASE_URL}/feed/"
-        f"{quote(requested_slug, safe='-')}"
-    )
+@app.get("/api/post/{slug:path}")
+async def post_page(request: Request, slug: str) -> Dict[str, Any]:
+    """Scrape one individual upstream /feed/<slug> page directly."""
+    requested_slug = normalize_requested_slug(slug)
+    encoded_slug = quote(requested_slug, safe="-")
+    target_url = f"{BASE_URL}/feed/{encoded_slug}"
 
     try:
-        result = await fetch_page(
-            target_url
-        )
-
-        parsed = parse_post_page(
-            result["html"],
-            requested_slug,
-            BASE_URL,
-        )
-
-        if parsed is None:
-            raise HTTPException(
-                status_code=404,
-                detail="Post not found.",
-            )
-
-        return {
-            "source": target_url,
-            "status": result["status"],
-            "final_url": result["url"],
-            "content_type": result.get(
-                "content_type"
-            ),
-            "html_length": result.get(
-                "html_length"
-            ),
-            **parsed,
-        }
-
-    except HTTPException:
-        raise
-
-    except Exception as error:
+        result = await fetch_page(target_url)
+    except Exception as exc:
         raise HTTPException(
-            status_code=500,
-            detail=(
-                "Post scraping failed: "
-                f"{type(error).__name__}: "
-                f"{str(error)}"
-            ),
+            status_code=502,
+            detail=f"Failed to fetch upstream post: {exc}",
+        ) from exc
+
+    html = result.get("html") or ""
+
+    if not html:
+        raise HTTPException(
+            status_code=502,
+            detail="Upstream post returned an empty HTML response.",
         )
+
+    parsed = parse_post_page(html, requested_slug, BASE_URL)
+
+    if parsed is None:
+        debug = parser_debug_info(html)
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": "Post not found.",
+                "requested_slug": requested_slug,
+                "upstream_status": result.get("status"),
+                "upstream_url": result.get("url") or target_url,
+                "html_length": result.get("html_length", len(html)),
+                "rsc_feed_count": debug.get("feed_object_count", 0),
+            },
+        )
+
+    return {
+        **parsed,
+        "source": target_url,
+        "requested_slug": requested_slug,
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "app:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=False,
+    )
