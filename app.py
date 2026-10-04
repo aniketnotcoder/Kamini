@@ -24,6 +24,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
+import asyncio
+
 from urllib.parse import quote, unquote, urlparse
 import re
 
@@ -154,6 +156,67 @@ async def scrape_feed(
     return parsed
 
 
+async def _enrich_search_items(
+    items: list[Dict[str, Any]],
+    base_url: str,
+    concurrency: int = 4,
+) -> list[Dict[str, Any]]:
+    """
+    Resolve search-result cards through their real `/post/<slug>` pages.
+
+    Search pages intentionally expose only card metadata.  The complete media
+    array and the recommendation list live on the individual post page, so
+    search enrichment reuses the same parser used by `/api/post/{slug}`.
+
+    Requests are bounded so a 12-result search does not create an unbounded
+    burst of upstream requests.  Result order always matches the search page.
+    """
+    if not items:
+        return items
+
+    semaphore = asyncio.Semaphore(max(1, int(concurrency)))
+
+    async def enrich_one(item: Dict[str, Any]) -> Dict[str, Any]:
+        slug = normalize_slug(item.get("slug"))
+        if not slug:
+            return item
+
+        target_url = f"{base_url}/post/{quote(slug, safe='-')}"
+
+        async with semaphore:
+            try:
+                result = await fetch_page(target_url)
+            except Exception as exc:
+                enriched = dict(item)
+                enriched["post_resolve_error"] = str(exc)
+                enriched["post_source"] = target_url
+                return enriched
+
+        html = result.get("html") or ""
+        if not html:
+            enriched = dict(item)
+            enriched["post_resolve_error"] = "Empty upstream post response."
+            enriched["post_source"] = target_url
+            return enriched
+
+        parsed = parse_post_page(html, slug, BASE_URL)
+        if parsed is None:
+            enriched = dict(item)
+            enriched["post_resolve_error"] = "Unable to parse the individual post page."
+            enriched["post_source"] = result.get("url") or target_url
+            return enriched
+
+        # The search card remains the discovery record, while the individual
+        # post parser supplies the authoritative media/recommendation fields.
+        enriched = dict(parsed)
+        enriched["url"] = target_url
+        enriched["thumbnail"] = item.get("thumbnail") or enriched.get("thumbnail")
+        enriched["post_source"] = result.get("url") or target_url
+        return enriched
+
+    return list(await asyncio.gather(*(enrich_one(item) for item in items)))
+
+
 async def scrape_listing(
     request: Request,
     upstream_url: str,
@@ -177,6 +240,18 @@ async def scrape_listing(
         )
 
     parsed = parse_listing_page(html, upstream_url, current_page=page)
+
+    # Search cards only contain title/slug/thumbnail. Resolve each real
+    # `/post/<slug>` page so search returns the same full media + recommendations
+    # contract as `/api/post/{slug}`. Channel/tag listings keep their fast RSC
+    # path and are not expanded here.
+    if (extra or {}).get("route_kind") == "search" and parsed.get("items"):
+        parsed["items"] = await _enrich_search_items(
+            parsed["items"],
+            BASE_URL,
+            concurrency=4,
+        )
+        parsed["count"] = len(parsed["items"])
 
     api_base = get_public_api_base(request)
     parsed["pagination"] = _normalize_discovery_pagination(
@@ -469,10 +544,10 @@ async def channel_page_number(
 
 @app.get("/api/post/{slug:path}")
 async def post_page(request: Request, slug: str) -> Dict[str, Any]:
-    """Scrape one individual upstream /feed/<slug> page directly."""
+    """Scrape one individual upstream /post/<slug> page directly."""
     requested_slug = normalize_requested_slug(slug)
     encoded_slug = quote(requested_slug, safe="-")
-    target_url = f"{BASE_URL}/feed/{encoded_slug}"
+    target_url = f"{BASE_URL}/post/{encoded_slug}"
 
     try:
         result = await fetch_page(target_url)
