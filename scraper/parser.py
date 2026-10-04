@@ -780,6 +780,174 @@ def _normalize_video_media(item: Dict[str, Any], base_url: str) -> Dict[str, Any
     return {key: value for key, value in result.items() if value is not None}
 
 
+
+def _duration_to_seconds(value: Any) -> Optional[int]:
+    """Convert common video duration representations to integer seconds."""
+    if value is None:
+        return None
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return int(value)
+
+    text = _clean_string(value)
+    if not text:
+        return None
+
+    numeric = _safe_int(text)
+    if numeric is not None and re.fullmatch(r"\d+(?:\.\d+)?", text):
+        return numeric
+
+    # ISO-8601 media duration, e.g. PT1H2M3S / PT42S.
+    match = re.fullmatch(
+        r"P(?:0D)?T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        hours = int(match.group(1) or 0)
+        minutes = int(match.group(2) or 0)
+        seconds = float(match.group(3) or 0)
+        return int(hours * 3600 + minutes * 60 + seconds)
+
+    # Clock-style duration, e.g. 01:23 or 01:02:03.
+    parts = text.split(":")
+    if len(parts) in (2, 3) and all(part.strip().isdigit() for part in parts):
+        values = [int(part) for part in parts]
+        if len(values) == 2:
+            return values[0] * 60 + values[1]
+        return values[0] * 3600 + values[1] * 60 + values[2]
+
+    return None
+
+
+def _walk_json_objects(value: Any) -> Iterator[Dict[str, Any]]:
+    """Yield dictionaries recursively from arbitrary JSON-like data."""
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _walk_json_objects(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _walk_json_objects(child)
+
+
+def extract_embed_video_metadata(html: str, base_url: str) -> Dict[str, Any]:
+    """
+    Extract rich metadata from a Downloaddirect-style embed document.
+
+    Feed pages expose the main media as iframe URLs only.  The embed document
+    can expose the actual MP4, poster/thumbnail and duration through JSON-LD,
+    normal <video>/<source> markup, meta tags, or serialized JavaScript data.
+    This function deliberately accepts all of those forms and returns only
+    fields that were actually found.
+    """
+    if not html:
+        return {}
+
+    soup = _soup(html)
+    result: Dict[str, Any] = {}
+
+    def set_if_missing(key: str, value: Any) -> None:
+        if result.get(key) in (None, "") and value not in (None, ""):
+            result[key] = value
+
+    # 1. JSON-LD / embedded JSON objects.
+    json_scripts = soup.find_all("script", attrs={"type": "application/ld+json"})
+    for script in json_scripts:
+        raw = script.string or script.get_text()
+        raw = raw.strip() if raw else ""
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+        for obj in _walk_json_objects(data):
+            set_if_missing(
+                "video_url",
+                absolute_url(
+                    _first_non_empty(
+                        obj.get("contentUrl"),
+                        obj.get("videoUrl"),
+                        obj.get("video_url"),
+                    ),
+                    base_url,
+                ),
+            )
+            set_if_missing(
+                "thumbnail",
+                absolute_url(
+                    _first_non_empty(
+                        obj.get("thumbnailUrl"),
+                        obj.get("thumbnail"),
+                        obj.get("poster"),
+                    ),
+                    base_url,
+                ),
+            )
+            set_if_missing("duration", _duration_to_seconds(obj.get("duration")))
+
+    # 2. Real HTML video/source elements.
+    for video in soup.find_all("video"):
+        set_if_missing("video_url", absolute_url(video.get("src"), base_url))
+        set_if_missing("thumbnail", absolute_url(video.get("poster"), base_url))
+        set_if_missing("duration", _duration_to_seconds(video.get("duration")))
+        source = video.find("source", src=True)
+        if source is not None:
+            set_if_missing("video_url", absolute_url(source.get("src"), base_url))
+
+    # 3. OpenGraph / media meta tags.
+    for meta in soup.find_all("meta"):
+        key = _clean_string(meta.get("property")) or _clean_string(meta.get("name"))
+        value = _clean_string(meta.get("content"))
+        if not key or not value:
+            continue
+        lowered = key.lower()
+        if lowered in {"og:image", "twitter:image", "video:thumbnail"}:
+            set_if_missing("thumbnail", absolute_url(value, base_url))
+        elif lowered in {"og:video", "og:video:url", "og:video:secure_url", "video:url"}:
+            set_if_missing("video_url", absolute_url(value, base_url))
+        elif lowered in {"video:duration", "og:video:duration"}:
+            set_if_missing("duration", _duration_to_seconds(value))
+
+    # 4. Serialized JS/Next data.  We intentionally use targeted patterns so
+    # arbitrary page text cannot accidentally become media metadata.
+    raw_text = html_lib.unescape(html)
+    escaped_text = raw_text.replace("\\/", "/")
+
+    url_patterns = (
+        r'"(?:videoUrl|video_url|contentUrl)"\s*:\s*"([^"]+)"',
+        r"'(?:videoUrl|video_url|contentUrl)'\s*:\s*'([^']+)'",
+    )
+    for pattern in url_patterns:
+        match = re.search(pattern, escaped_text, flags=re.IGNORECASE)
+        if match:
+            set_if_missing("video_url", absolute_url(match.group(1), base_url))
+            break
+
+    thumb_patterns = (
+        r'"(?:thumbnailUrl|thumbnail|poster)"\s*:\s*"([^"]+)"',
+        r"'(?:thumbnailUrl|thumbnail|poster)'\s*:\s*'([^']+)'",
+    )
+    for pattern in thumb_patterns:
+        match = re.search(pattern, escaped_text, flags=re.IGNORECASE)
+        if match:
+            set_if_missing("thumbnail", absolute_url(match.group(1), base_url))
+            break
+
+    duration_patterns = (
+        r'"duration"\s*:\s*("[^"]+"|\d+(?:\.\d+)?)',
+        r"'duration'\s*:\s*('[^']+'|\d+(?:\.\d+)?)",
+    )
+    for pattern in duration_patterns:
+        match = re.search(pattern, escaped_text, flags=re.IGNORECASE)
+        if match:
+            raw_duration = match.group(1).strip('"\'')
+            set_if_missing("duration", _duration_to_seconds(raw_duration))
+            break
+
+    return {key: value for key, value in result.items() if value not in (None, "")}
+
 def _normalize_image_media(item: Dict[str, Any], base_url: str) -> Dict[str, Any]:
     """Normalize one raw image media item."""
     image_url = absolute_url(
@@ -2143,6 +2311,7 @@ __all__ = [
     "classify_media",
     "combined_rsc_payload",
     "extract_dom_feed_items",
+    "extract_embed_video_metadata",
     "extract_feed_objects",
     "extract_iframe_urls",
     "extract_media_urls_from_html",
