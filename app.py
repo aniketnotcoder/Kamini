@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 
 from scraper.fetcher import fetch_page
 from scraper.parser import parse_page
@@ -10,6 +10,10 @@ app = FastAPI(
 )
 
 
+# ─────────────────────────────────────────────
+# API ROOT
+# ─────────────────────────────────────────────
+
 @app.get("/api")
 async def api_root():
     return {
@@ -19,6 +23,10 @@ async def api_root():
     }
 
 
+# ─────────────────────────────────────────────
+# HEALTH CHECK
+# ─────────────────────────────────────────────
+
 @app.get("/api/health")
 async def health():
     return {
@@ -26,47 +34,78 @@ async def health():
         "service": "kamini-scraper"
     }
 
+
+# ─────────────────────────────────────────────
+# FIRST FEED PAGE
+# https://desihub.sh/feed
+# ─────────────────────────────────────────────
+
 @app.get("/api/feed")
 async def feed_first_page():
 
     target = "https://desihub.sh/feed"
 
-    result = await fetch_page(target)
+    try:
+        result = await fetch_page(target)
 
-    parsed = parse_page(
-        result["html"],
-        result["url"]
-    )
+        parsed = parse_page(
+            result["html"],
+            result["url"]
+        )
 
-    return {
-        "source": target,
-        "status": result["status"],
-        "final_url": result["url"],
-        **parsed
-    }
+        return {
+            "source": target,
+            "page": 1,
+            "status": result["status"],
+            "final_url": result["url"],
+            **parsed
+        }
 
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=str(error)
+        )
+
+
+# ─────────────────────────────────────────────
+# NUMBERED FEED PAGES
+#
+# /api/feed/2
+# /api/feed/3
+# /api/feed/4
+# ...
+# ─────────────────────────────────────────────
 
 @app.get("/api/feed/{page:int}")
-async def feed_page(page: int):
+async def feed_numbered_page(page: int):
 
     if page < 2:
-        return {
-            "error": "Use /api/feed for the first page. Numbered pages start at /2."
-        }
+        raise HTTPException(
+            status_code=400,
+            detail="Page 1 uses /api/feed. Numbered feed pages start from /api/feed/2."
+        )
 
     target = f"https://desihub.sh/feed/{page}"
 
-    result = await fetch_page(target)
+    try:
+        result = await fetch_page(target)
 
-    parsed = parse_page(
-        result["html"],
-        result["url"]
-    )
+        parsed = parse_page(
+            result["html"],
+            result["url"]
+        )
 
-    return {
-        "source": target,
-        "page": page,
-        "status": result["status"],
-        "final_url": result["url"],
-        **parsed
-    }
+        return {
+            "source": target,
+            "page": page,
+            "status": result["status"],
+            "final_url": result["url"],
+            **parsed
+        }
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=str(error)
+        )
