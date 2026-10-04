@@ -922,12 +922,18 @@ def build_public_item(feed_object: Dict[str, Any], base_url: str) -> Dict[str, A
     # Metadata fields are useful on individual post responses and are safe to
     # expose on feed items too.  They are kept null-free for cleaner JSON.
     optional_metadata = {
-        "id": _clean_string(feed_object.get("_id")),
-        "channel_id": _clean_string(feed_object.get("channelId")),
-        "channel_name": _clean_string(feed_object.get("channelName")),
+        "id": _clean_string(_first_non_empty(feed_object.get("_id"), feed_object.get("id"))),
+        "channel_id": _clean_string(
+            _first_non_empty(feed_object.get("channelId"), feed_object.get("channel_id"))
+        ),
+        "channel_name": _clean_string(
+            _first_non_empty(feed_object.get("channelName"), feed_object.get("channel_name"))
+        ),
         "username": _clean_string(feed_object.get("username")),
         "avatar": absolute_url(feed_object.get("avatar"), base_url),
-        "created_at": _clean_string(feed_object.get("createdAt")),
+        "created_at": _clean_string(
+            _first_non_empty(feed_object.get("createdAt"), feed_object.get("created_at"))
+        ),
     }
 
     item.update(optional_metadata)
@@ -1349,58 +1355,331 @@ def parse_page(
 # -----------------------------------------------------------------------------
 
 
+def _decode_next_image_url(value: Any) -> Optional[str]:
+    """
+    Recover the original image URL from a Next.js optimized image URL.
+
+    Direct post pages render `/_next/image?url=<original>&...` in normal HTML.
+    Feed RSC objects already contain the original URL, so this helper is only
+    used by the direct-post DOM parser.
+    """
+    raw = _clean_string(value)
+    if not raw:
+        return None
+
+    parsed = urlparse(raw)
+    if parsed.path.rstrip("/") == "/_next/image":
+        from urllib.parse import parse_qs
+
+        query = parse_qs(parsed.query)
+        original = query.get("url", [None])[0]
+        if original:
+            return unquote(original)
+
+    return raw
+
+
+def _dom_image_source(image: Any) -> Optional[str]:
+    """Return the best original source URL for a rendered <img>."""
+    candidates: List[str] = []
+
+    for attribute in ("src", "data-src", "data-lazy-src"):
+        value = _decode_next_image_url(image.get(attribute))
+        if value:
+            candidates.append(value)
+
+    srcset = _clean_string(image.get("srcset")) or _clean_string(image.get("srcSet"))
+    if srcset:
+        # Prefer the largest source from srcset.  Each entry is `url width`.
+        for entry in srcset.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            candidate = entry.split()[0]
+            decoded = _decode_next_image_url(candidate)
+            if decoded:
+                candidates.append(decoded)
+
+    return candidates[-1] if candidates else None
+
+
+def _is_main_post_media_container(node: Any) -> bool:
+    """Return True for the exact media wrapper used by direct post pages."""
+    classes = node.get("class", []) if hasattr(node, "get") else []
+    if isinstance(classes, str):
+        classes = classes.split()
+    classes = set(classes or [])
+    return "mb-4" in classes and "space-y-3" in classes
+
+
+def _find_main_post_media_container(h1: Any) -> Optional[Any]:
+    """
+    Find the media wrapper belonging to the main post H1.
+
+    The direct post page structure is:
+        channel header -> h1 -> div.mb-4.space-y-3 -> media blocks
+
+    We deliberately anchor this to the H1 instead of scanning every iframe/img
+    on the page, because the page also contains channel/recommendation images.
+    """
+    if h1 is None:
+        return None
+
+    for sibling in h1.find_all_next("div"):
+        if _is_main_post_media_container(sibling):
+            return sibling
+
+    return None
+
+
+def _extract_direct_post_media(container: Any, base_url: str) -> List[Dict[str, Any]]:
+    """
+    Extract the main post's media in exact DOM order.
+
+    Each direct child of the media wrapper is one media block.  Video blocks
+    contain an iframe; image blocks contain a blurred background image plus the
+    real image.  The blurred image is marked aria-hidden/empty-alt and is
+    intentionally ignored.
+    """
+    if container is None:
+        return []
+
+    media: List[Dict[str, Any]] = []
+
+    for block in container.find_all(recursive=False):
+        # BeautifulSoup may expose whitespace as NavigableString; those do not
+        # have find()/get() and are skipped naturally here.
+        if not hasattr(block, "find"):
+            continue
+
+        iframe = block.find("iframe")
+        if iframe is not None:
+            src = absolute_url(iframe.get("src"), base_url)
+            if src:
+                video_id = None
+                parsed = urlparse(src)
+                parts = [part for part in parsed.path.split("/") if part]
+                if len(parts) >= 2 and parts[-2].lower() == "embed":
+                    video_id = _clean_string(parts[-1])
+
+                media.append(
+                    {
+                        "type": "video",
+                        "id": video_id,
+                        "videoId": video_id,
+                        "url": src,
+                    }
+                )
+            continue
+
+        images = block.find_all("img")
+        if images:
+            chosen = None
+            # Prefer the actual displayed image over the blurred background.
+            for image in images:
+                alt = _clean_string(image.get("alt"))
+                aria_hidden = (_clean_string(image.get("aria-hidden")) or "").lower()
+                classes = image.get("class", [])
+                if isinstance(classes, str):
+                    classes = classes.split()
+                class_text = " ".join(classes or []).lower()
+
+                if aria_hidden == "true" or not alt or "blur-2xl" in class_text:
+                    continue
+
+                chosen = image
+                break
+
+            if chosen is None:
+                chosen = images[-1]
+
+            image_url = _dom_image_source(chosen)
+            if image_url:
+                media.append(
+                    {
+                        "type": "image",
+                        "id": None,
+                        "url": image_url,
+                    }
+                )
+
+    return media
+
+
+def _extract_direct_post_metadata(h1: Any, base_url: str) -> Dict[str, Any]:
+    """Extract channel metadata located immediately before the main H1."""
+    metadata: Dict[str, Any] = {}
+    if h1 is None:
+        return metadata
+
+    channel_anchor = None
+    for anchor in h1.find_all_previous("a", href=True):
+        href = _clean_string(anchor.get("href")) or ""
+        if href.startswith("/channels/"):
+            channel_anchor = anchor
+            break
+
+    if channel_anchor is None:
+        return metadata
+
+    channel_href = _clean_string(channel_anchor.get("href"))
+    if channel_href:
+        channel_path = urlparse(channel_href).path.strip("/")
+        parts = channel_path.split("/")
+        if len(parts) >= 2 and parts[0] == "channels":
+            metadata["channel_id"] = parts[1]
+
+    channel_name = channel_anchor.find("h3")
+    if channel_name:
+        metadata["channel_name"] = _clean_string(channel_name.get_text(" ", strip=True))
+
+    username_node = channel_anchor.find("p")
+    if username_node:
+        username_text = _clean_string(username_node.get_text(" ", strip=True))
+        if username_text:
+            metadata["username"] = username_text.lstrip("@").strip()
+
+    avatar = channel_anchor.find("img")
+    if avatar is not None:
+        avatar_url = _dom_image_source(avatar)
+        if avatar_url:
+            metadata["avatar"] = absolute_url(avatar_url, base_url)
+
+    return {key: value for key, value in metadata.items() if value is not None}
+
+
+def _extract_direct_post_description(h1: Any) -> Optional[str]:
+    """Extract the main post description paragraph, if present."""
+    if h1 is None:
+        return None
+
+    container = _find_main_post_media_container(h1)
+    if container is None:
+        return None
+
+    # The prose description is the next sibling after the media wrapper in the
+    # current direct-post layout.  Restrict the search to a nearby div so the
+    # recommendation section cannot be mistaken for the description.
+    for sibling in container.find_all_next("div", limit=5):
+        classes = sibling.get("class", [])
+        if isinstance(classes, str):
+            classes = classes.split()
+        if "prose" not in set(classes or []):
+            continue
+        paragraph = sibling.find("p")
+        if paragraph:
+            return _clean_string(paragraph.get_text(" ", strip=True))
+
+    return None
+
+
+def _extract_direct_post_tags(h1: Any) -> List[str]:
+    """Extract tag labels from the main post before the recommendation area."""
+    if h1 is None:
+        return []
+
+    container = _find_main_post_media_container(h1)
+    if container is None:
+        return []
+
+    description_div = None
+    for sibling in container.find_all_next("div", limit=8):
+        classes = sibling.get("class", [])
+        if isinstance(classes, str):
+            classes = classes.split()
+        if "prose" in set(classes or []):
+            description_div = sibling
+            break
+
+    if description_div is None:
+        return []
+
+    tags: List[str] = []
+    for sibling in description_div.find_all_next("div", limit=4):
+        classes = sibling.get("class", [])
+        if isinstance(classes, str):
+            classes = classes.split()
+        if "flex-wrap" not in set(classes or []):
+            continue
+        for anchor in sibling.find_all("a", href=True):
+            label = _clean_string(anchor.get_text(" ", strip=True))
+            if label:
+                tags.append(label)
+        if tags:
+            break
+
+    return _dedupe_preserve_order(tags)
+
+
+def _build_dom_post_object(
+    h1: Any,
+    requested_slug: str,
+    html: str,
+    base_url: str,
+) -> Optional[Dict[str, Any]]:
+    """Build a feed-shaped object from the direct post DOM."""
+    title = _clean_string(h1.get_text(" ", strip=True)) if h1 is not None else None
+    if not title:
+        return None
+
+    media_container = _find_main_post_media_container(h1)
+    media = _extract_direct_post_media(media_container, base_url)
+
+    # A valid direct post can technically have no media, but the page still
+    # needs to be identified correctly.  We therefore accept the object as long
+    # as its H1 exists and the requested route slug is valid.
+    feed_object: Dict[str, Any] = {
+        "_id": None,
+        "slug": normalize_slug(requested_slug),
+        "title": title,
+        "mediaItems": media,
+    }
+    feed_object.update(_extract_direct_post_metadata(h1, base_url))
+
+    description = _extract_direct_post_description(h1)
+    if description:
+        feed_object["description"] = description
+
+    tags = _extract_direct_post_tags(h1)
+    if tags:
+        feed_object["tags"] = tags
+
+    return feed_object
+
+
 def _find_dom_post_match(html: str, requested_slug: str, base_url: str) -> Optional[Dict[str, Any]]:
-    """Build a minimal post object from a matching DOM anchor."""
-    wanted_key = slug_key(requested_slug)
-    if not wanted_key:
+    """
+    Parse the actual direct `/feed/<slug>` page.
+
+    This is intentionally NOT a feed-card parser.  Individual post pages do
+    not render the main post as an `<a href="/feed/<slug>">` card.  Instead the
+    page has a channel header, one `<h1>`, then the main media wrapper.
+    """
+    wanted = normalize_slug(requested_slug)
+    if not wanted:
         return None
 
     soup = _soup(html)
+    h1 = soup.find("h1")
+    if h1 is None:
+        return None
 
-    for anchor in soup.find_all("a", href=True):
-        href = _clean_string(anchor.get("href"))
-        if not href:
-            continue
+    # The direct post route is already the requested slug.  We still verify any
+    # explicit canonical/path evidence when it exists, but we do not require a
+    # `/feed/<slug>` anchor because there isn't one on the main post itself.
+    canonical_slug = None
+    canonical = soup.find("link", rel=lambda value: value and "canonical" in value)
+    if canonical is not None:
+        canonical_slug = extract_slug_from_url(_clean_string(canonical.get("href")) or "")
 
-        slug = extract_slug_from_url(href)
-        if not slug or slug_key(slug) != wanted_key:
-            continue
+    if canonical_slug and slug_key(canonical_slug) != slug_key(wanted):
+        return None
 
-        heading = anchor.find(["h1", "h2", "h3", "h4"])
-        title = _clean_string(heading.get_text(" ", strip=True)) if heading else extract_title_from_dom(html)
+    feed_object = _build_dom_post_object(h1, wanted, html, base_url)
+    if feed_object is None:
+        return None
 
-        media: List[Dict[str, Any]] = []
-
-        for iframe in anchor.find_all("iframe"):
-            src = absolute_url(iframe.get("src"), base_url)
-            if src:
-                media.append({"type": "video", "embed_url": src})
-
-        for image in anchor.find_all("img"):
-            src = absolute_url(image.get("src"), base_url)
-            if src:
-                media.append({"type": "image", "image_url": src})
-
-        videos = get_video_media(media)
-        first_video = videos[0] if videos else None
-
-        return {
-            "title": title,
-            "slug": slug,
-            "url": absolute_url(href, base_url),
-            "type": classify_media(media),
-            "media_count": len(media),
-            "video_count": len(videos),
-            "image_count": len(get_image_media(media)),
-            "media": media,
-            "embed_url": first_video.get("embed_url") if first_video else None,
-            "video_id": None,
-            "video_url": None,
-            "thumbnail": None,
-            "duration": None,
-        }
-
-    return None
+    return build_public_item(feed_object, base_url)
 
 
 def parse_post_page(
@@ -1409,21 +1688,28 @@ def parse_post_page(
     base_url: str,
 ) -> Optional[Dict[str, Any]]:
     """
-    Parse an individual `/feed/<slug>` page.
+    Parse one individual `/feed/<slug>` page.
 
-    Primary strategy:
-        1. reconstruct complete RSC stream
-        2. extract every `feed` object directly
-        3. exact-match requested slug
-        4. normalize into public item
+    Important architecture:
+        * Feed pages (`/feed`, `/feed/page/N`) use RSC feed objects.
+        * Individual post pages (`/feed/<slug>`) are parsed from their direct
+          rendered HTML first.  The main post is not a normal `feed` RSC object;
+          the RSC feed objects on that page are recommendation cards.
 
-    DOM is only a final fallback.  We never substitute a different feed post
-    just because it happens to be present on the page.
+    RSC remains a secondary fallback for unusual page variants, never the
+    primary lookup for the direct post.
     """
     wanted = normalize_slug(requested_slug)
     if not wanted:
         return None
 
+    # PRIMARY: direct post DOM.
+    dom_match = _find_dom_post_match(html, wanted, base_url)
+    if dom_match is not None:
+        return dom_match
+
+    # SECONDARY: some upstream revisions may serialize the main post as a
+    # normal feed object.  Preserve the old robust RSC recovery for those pages.
     stream = combined_rsc_payload(html)
     feed_objects = extract_rsc_feed_objects(html)
     match = find_feed_object_by_slug(feed_objects, wanted)
@@ -1431,9 +1717,6 @@ def parse_post_page(
     if match is not None:
         return build_public_item(match, base_url)
 
-    # Individual post pages can expose the exact feed object in a streamed RSC
-    # value whose row boundaries differ from the feed-list page. Recover it by
-    # anchoring on the requested slug inside the already reconstructed stream.
     near_slug_match = _extract_feed_object_near_slug(stream, wanted)
     if near_slug_match is not None:
         return build_public_item(near_slug_match, base_url)
@@ -1442,9 +1725,7 @@ def parse_post_page(
     if partial_match is not None:
         return build_public_item(partial_match, base_url)
 
-    # Some page layouts may expose the primary post in rendered HTML even if the
-    # RSC data was blocked or changed. Only accept an exact slug match.
-    return _find_dom_post_match(html, wanted, base_url)
+    return None
 
 
 # -----------------------------------------------------------------------------
