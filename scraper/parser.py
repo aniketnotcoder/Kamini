@@ -898,16 +898,22 @@ def extract_rsc_media(feed_object: Dict[str, Any], base_url: str) -> List[Dict[s
 # -----------------------------------------------------------------------------
 
 
-def _feed_url(feed_object: Dict[str, Any], base_url: str) -> Optional[str]:
-    """Build the upstream public post URL."""
+def _post_url(feed_object: Dict[str, Any], base_url: str, route: str = "feed") -> Optional[str]:
+    """Build the upstream public post URL for a known post-family route."""
     slug = normalize_slug(feed_object.get("slug"))
     if not slug:
         return None
 
-    return f"{base_url.rstrip('/')}/feed/{slug}"
+    route = "post" if route == "post" else "feed"
+    return f"{base_url.rstrip('/')}/{route}/{slug}"
 
 
-def build_public_item(feed_object: Dict[str, Any], base_url: str) -> Dict[str, Any]:
+def _feed_url(feed_object: Dict[str, Any], base_url: str) -> Optional[str]:
+    """Backward-compatible helper for the Feed post family."""
+    return _post_url(feed_object, base_url, "feed")
+
+
+def build_public_item(feed_object: Dict[str, Any], base_url: str, route: str = "feed") -> Dict[str, Any]:
     """
     Convert one raw Desihub feed object to the public API item.
 
@@ -924,7 +930,7 @@ def build_public_item(feed_object: Dict[str, Any], base_url: str) -> Dict[str, A
     item: Dict[str, Any] = {
         "title": _clean_string(feed_object.get("title")),
         "slug": slug,
-        "url": _feed_url(feed_object, base_url),
+        "url": _post_url(feed_object, base_url, route),
         "type": classify_media(media),
         "media_count": len(media),
         "video_count": len(videos),
@@ -1204,7 +1210,7 @@ def extract_title_from_dom(html: str) -> Optional[str]:
 
 
 def extract_slug_from_url(url: str) -> Optional[str]:
-    """Extract a post slug from a /feed/<slug> URL."""
+    """Extract a post slug from either a /feed/<slug> or /post/<slug> URL."""
     value = _clean_string(url)
     if not value:
         return None
@@ -1212,14 +1218,14 @@ def extract_slug_from_url(url: str) -> Optional[str]:
     parsed = urlparse(value)
     path = parsed.path.strip("/")
 
-    if not path.startswith("feed/"):
-        return None
+    for prefix in ("feed/", "post/"):
+        if path.startswith(prefix):
+            remainder = path[len(prefix) :]
+            if remainder.startswith("page/"):
+                return None
+            return normalize_slug(remainder)
 
-    remainder = path[len("feed/") :]
-    if remainder.startswith("page/"):
-        return None
-
-    return normalize_slug(remainder)
+    return None
 
 
 def extract_slug_from_dom(html: str) -> Optional[str]:
@@ -1741,6 +1747,16 @@ def _build_dom_post_object(
     media_container = _find_main_post_media_container(h1)
     media = _extract_direct_post_media(media_container, base_url)
 
+    # Main-site /post/<slug> pages use a different template: the media is
+    # inside the surrounding <article>, not the Feed template's
+    # div.mb-4.space-y-3 wrapper.  Keep the Feed selector above, then use the
+    # article as the bounded fallback so recommendation/aside media is never
+    # accidentally included.
+    if not media and hasattr(h1, "find_parent"):
+        article = h1.find_parent("article")
+        if article is not None:
+            media = _extract_direct_post_media(article, base_url)
+
     # A valid direct post can technically have no media, but the page still
     # needs to be identified correctly.  We therefore accept the object as long
     # as its H1 exists and the requested route slug is valid.
@@ -1761,6 +1777,19 @@ def _build_dom_post_object(
         feed_object["tags"] = tags
 
     return feed_object
+
+
+def detect_post_route(url: Any) -> Optional[str]:
+    """Detect Desihub's two individual-post URL families."""
+    value = _clean_string(url)
+    if not value:
+        return None
+    path = urlparse(value).path.strip("/")
+    if path.startswith("post/"):
+        return "post"
+    if path.startswith("feed/") and not path.startswith("feed/page/"):
+        return "feed"
+    return None
 
 
 def _find_dom_post_match(html: str, requested_slug: str, base_url: str) -> Optional[Dict[str, Any]]:
@@ -1861,37 +1890,49 @@ def parse_post_page(
     html: str,
     requested_slug: str,
     base_url: str,
+    route_hint: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """
-    Parse one individual `/post/<slug>` page.
+    """Parse one individual Desihub post from the correct page family.
 
-    Important architecture:
-        * Feed pages (`/feed`, `/feed/page/N`) use RSC feed objects.
-        * Individual post pages (`/post/<slug>`) are parsed from their direct
-          rendered HTML first.  The main post is not a normal `feed` RSC object;
-          the RSC feed objects on that page are recommendation cards.
+    Desihub has two different individual-post systems:
+      * /post/<slug> -> main-site post template
+      * /feed/<slug> -> Feed post template
 
-    RSC remains a secondary fallback for unusual page variants, never the
-    primary lookup for the direct post.
+    The caller may provide route_hint when the source URL is already known.
+    Without it, the parser retains the historical auto-detection behavior.
     """
     wanted = normalize_slug(requested_slug)
     if not wanted:
         return None
 
-    # PRIMARY: direct post DOM.
-    dom_match = _find_dom_post_match(html, wanted, base_url)
-    if dom_match is not None:
-        return _attach_post_recommendations(dom_match, html, wanted, base_url)
+    route = route_hint if route_hint in {"post", "feed"} else None
 
-    # SECONDARY: some upstream revisions may serialize the main post as a
-    # normal feed object.  Preserve the old robust RSC recovery for those pages.
+    # Both page families have a rendered H1/media DOM.  The parser's DOM
+    # selectors are template-aware, so use that first for the known family.
+    if route in (None, "post", "feed"):
+        dom_match = _find_dom_post_match(html, wanted, base_url)
+        if dom_match is not None:
+            if route:
+                resolved_route = route
+            else:
+                soup = _soup(html)
+                canonical = soup.find("link", rel=lambda value: value and "canonical" in value)
+                resolved_route = detect_post_route(canonical.get("href") if canonical else None) or "post"
+            dom_match["url"] = _post_url({"slug": wanted}, base_url, resolved_route)
+            return _attach_post_recommendations(dom_match, html, wanted, base_url)
+
+        if route == "post":
+            return None
+
+    # Feed RSC is the recovery path for Feed pages whose rendered DOM does not
+    # expose enough media information.
     stream = combined_rsc_payload(html)
     feed_objects = extract_rsc_feed_objects(html)
     match = find_feed_object_by_slug(feed_objects, wanted)
 
     if match is not None:
         return _attach_post_recommendations(
-            build_public_item(match, base_url),
+            build_public_item(match, base_url, route="feed"),
             html,
             wanted,
             base_url,
@@ -1900,7 +1941,7 @@ def parse_post_page(
     near_slug_match = _extract_feed_object_near_slug(stream, wanted)
     if near_slug_match is not None:
         return _attach_post_recommendations(
-            build_public_item(near_slug_match, base_url),
+            build_public_item(near_slug_match, base_url, route="feed"),
             html,
             wanted,
             base_url,
@@ -1909,7 +1950,7 @@ def parse_post_page(
     partial_match = _extract_post_object_from_stream_by_slug(stream, wanted)
     if partial_match is not None:
         return _attach_post_recommendations(
-            build_public_item(partial_match, base_url),
+            build_public_item(partial_match, base_url, route="feed"),
             html,
             wanted,
             base_url,
@@ -1942,6 +1983,7 @@ def parser_debug_info(html: str) -> Dict[str, Any]:
 __all__ = [
     "absolute_url",
     "build_public_item",
+    "detect_post_route",
     "classify_media",
     "combined_rsc_payload",
     "extract_dom_feed_items",
