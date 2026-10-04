@@ -857,14 +857,14 @@ def parse_page(source_html, page_url):
     # PAGINATION
     # ========================================================
 
+current_page = extract_page_number(
+        page_url
+    )
+
     pagination = extract_pagination(
         soup,
         page_url,
         current_page,
-    )
-
-    current_page = extract_page_number(
-        page_url
     )
 
     # Page 2+ previous-page fallback.
