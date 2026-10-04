@@ -33,6 +33,7 @@ from fetcher import fetch_page
 from scraper.parser import (
     extract_generic_page_number_from_url,
     extract_page_number_from_url,
+    detect_post_route,
     normalize_slug,
     parse_listing_page,
     parse_page,
@@ -342,18 +343,25 @@ def _normalize_page_value(page: int) -> int:
 
 
 def _candidate_post_urls(slug: str) -> List[str]:
-    """
-    Return upstream post routes in preferred order.
-
-    Search result cards currently expose `/post/<slug>`, while the direct-post
-    route used by the earlier captured post page is `/feed/<slug>`.
-    We therefore support both instead of assuming one route globally.
-    """
+    """Return both Desihub individual-post families for route discovery."""
     encoded = quote(slug, safe="-")
     return [
         f"{BASE_URL}/post/{encoded}",
         f"{BASE_URL}/feed/{encoded}",
     ]
+
+
+def _route_candidates_for_item(item: Dict[str, Any], slug: str) -> List[Tuple[str, str]]:
+    """Choose the upstream post family from the item's actual href."""
+    route = detect_post_route(item.get("url")) or detect_post_route(item.get("source"))
+    encoded = quote(slug, safe="-")
+
+    if route == "post":
+        return [("post", f"{BASE_URL}/post/{encoded}")]
+    if route == "feed":
+        return [("feed", f"{BASE_URL}/feed/{encoded}")]
+
+    return [("post", f"{BASE_URL}/post/{encoded}"), ("feed", f"{BASE_URL}/feed/{encoded}")]
 
 
 async def _resolve_search_item(
@@ -374,7 +382,7 @@ async def _resolve_search_item(
     async with semaphore:
         errors: List[str] = []
 
-        for target_url in _candidate_post_urls(slug):
+        for route_hint, target_url in _route_candidates_for_item(item, slug):
             try:
                 result = await fetch_page(target_url)
             except Exception as exc:
@@ -387,7 +395,7 @@ async def _resolve_search_item(
                 continue
 
             try:
-                parsed = parse_post_page(html, slug, BASE_URL)
+                parsed = parse_post_page(html, slug, BASE_URL, route_hint=route_hint)
             except Exception as exc:
                 errors.append(f"{target_url}: parser error: {exc}")
                 continue
@@ -672,7 +680,8 @@ async def post_page(request: Request, slug: str) -> Dict[str, Any]:
             continue
 
         try:
-            parsed = parse_post_page(html, requested_slug, BASE_URL)
+            route_hint = detect_post_route(target_url)
+            parsed = parse_post_page(html, requested_slug, BASE_URL, route_hint=route_hint)
         except Exception as exc:
             errors.append(f"{target_url}: parser error: {exc}")
             continue
