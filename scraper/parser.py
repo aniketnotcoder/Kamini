@@ -2236,6 +2236,18 @@ def parse_feed_post_page(
     if item is None:
         return None
 
+    # The rendered /feed/<slug> HTML does not expose the Mongo post _id.
+    # Keep the public id field useful for this media-first endpoint by using
+    # the primary video's stable upstream media id as the fallback.  Never
+    # overwrite a real post id if a future template starts exposing one.
+    if not item.get("id"):
+        videos = [
+            media for media in item.get("media", [])
+            if isinstance(media, dict) and media.get("type") == "video"
+        ]
+        if videos and videos[0].get("id"):
+            item["id"] = videos[0].get("id")
+
     recommendations = extract_feed_post_recommendations(html, wanted, base_url)
     item["recommendation_count"] = len(recommendations)
     item["recommendations"] = recommendations
