@@ -1727,23 +1727,114 @@ def _extract_direct_post_tags(h1: Any) -> List[str]:
     return _dedupe_preserve_order(tags)
 
 
+
+def _extract_direct_post_jsonld(h1: Any, html: str, base_url: str) -> Dict[str, Any]:
+    """Extract VideoObject/WebPage metadata from the direct post JSON-LD."""
+    soup = _soup(html)
+    result: Dict[str, Any] = {}
+
+    def walk(value: Any):
+        if isinstance(value, dict):
+            yield value
+            for child in value.values():
+                yield from walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                yield from walk(child)
+
+    for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        raw = script.string or script.get_text()
+        raw = raw.strip() if raw else ""
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+
+        for obj in walk(data):
+            if not isinstance(obj, dict):
+                continue
+            obj_type = obj.get("@type")
+            types = obj_type if isinstance(obj_type, list) else [obj_type]
+
+            if "VideoObject" in types:
+                thumbs = obj.get("thumbnailUrl")
+                if isinstance(thumbs, list):
+                    thumb = thumbs[0] if thumbs else None
+                else:
+                    thumb = thumbs
+
+                video = {
+                    "type": "video",
+                    "id": None,
+                    "videoId": None,
+                    "url": absolute_url(obj.get("embedUrl"), base_url) if obj.get("embedUrl") else None,
+                    "embed_url": absolute_url(obj.get("embedUrl"), base_url) if obj.get("embedUrl") else None,
+                    "video_id": None,
+                    "video_url": absolute_url(obj.get("contentUrl"), base_url) if obj.get("contentUrl") else None,
+                    "thumbnail": absolute_url(thumb, base_url) if thumb else None,
+                    "duration": obj.get("duration"),
+                }
+
+                embed = _clean_string(obj.get("embedUrl")) or ""
+                parts = [part for part in urlparse(embed).path.split("/") if part]
+                if len(parts) >= 2 and parts[-2].lower() == "embed":
+                    vid = _clean_string(parts[-1])
+                    video["id"] = vid
+                    video["videoId"] = vid
+                    video["video_id"] = vid
+
+                result["video"] = video
+                result["created_at"] = _clean_string(obj.get("uploadDate"))
+                result["jsonld_title"] = _clean_string(obj.get("name"))
+                continue
+
+            if "WebPage" in types:
+                image = obj.get("image")
+                if isinstance(image, list):
+                    image = image[0] if image else None
+                if isinstance(image, dict):
+                    image = image.get("url")
+                if image:
+                    result["thumbnail"] = absolute_url(image, base_url)
+                result["created_at"] = result.get("created_at") or _clean_string(obj.get("datePublished"))
+
+    return result
+
+
 def _build_dom_post_object(
     h1: Any,
     requested_slug: str,
     html: str,
     base_url: str,
 ) -> Optional[Dict[str, Any]]:
-    """Build a feed-shaped object from the direct post DOM."""
+    """Build a feed-shaped object from the direct post DOM + JSON-LD."""
     title = _clean_string(h1.get_text(" ", strip=True)) if h1 is not None else None
     if not title:
         return None
 
     media_container = _find_main_post_media_container(h1)
     media = _extract_direct_post_media(media_container, base_url)
+    jsonld = _extract_direct_post_jsonld(h1, html, base_url)
 
-    # A valid direct post can technically have no media, but the page still
-    # needs to be identified correctly.  We therefore accept the object as long
-    # as its H1 exists and the requested route slug is valid.
+    # The direct post HTML can expose the iframe in the DOM, while JSON-LD
+    # supplies contentUrl/thumbnail/uploadDate. Merge them instead of treating
+    # either source as complete on its own.
+    if jsonld.get("video"):
+        jvideo = jsonld["video"]
+        if media:
+            video = media[0]
+            video["embed_url"] = jvideo.get("embed_url") or video.get("url")
+            video["video_id"] = jvideo.get("video_id") or video.get("videoId")
+            video["videoId"] = video.get("video_id")
+            video["id"] = video.get("video_id")
+            video["video_url"] = jvideo.get("video_url")
+            video["thumbnail"] = jvideo.get("thumbnail")
+            video["duration"] = jvideo.get("duration")
+        else:
+            media = [jvideo]
+
     feed_object: Dict[str, Any] = {
         "_id": None,
         "slug": normalize_slug(requested_slug),
@@ -1751,6 +1842,9 @@ def _build_dom_post_object(
         "mediaItems": media,
     }
     feed_object.update(_extract_direct_post_metadata(h1, base_url))
+
+    if jsonld.get("created_at"):
+        feed_object["createdAt"] = jsonld["created_at"]
 
     description = _extract_direct_post_description(h1)
     if description:
