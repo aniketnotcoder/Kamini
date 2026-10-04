@@ -33,7 +33,6 @@ from fetcher import fetch_page
 from scraper.parser import (
     extract_generic_page_number_from_url,
     extract_page_number_from_url,
-    detect_post_route,
     normalize_slug,
     parse_listing_page,
     parse_page,
@@ -340,6 +339,20 @@ def _normalize_page_value(page: int) -> int:
 # -----------------------------------------------------------------------------
 # Search post enrichment
 # -----------------------------------------------------------------------------
+
+
+def detect_post_route(value: Any) -> Optional[str]:
+    """Detect whether a listing URL belongs to /feed/ or /post/."""
+    if not value:
+        return None
+    text = unquote(str(value)).strip()
+    parsed = urlparse(text)
+    path = parsed.path or text
+    if re.search(r"(?:^|/)feed/", path, flags=re.IGNORECASE):
+        return "feed"
+    if re.search(r"(?:^|/)post/", path, flags=re.IGNORECASE):
+        return "post"
+    return None
 
 
 def _post_url(slug: str, route: str) -> str:
