@@ -26,9 +26,33 @@ async def health():
         "service": "kamini-scraper"
     }
 
+@app.get("/api/feed")
+async def feed_first_page():
 
-@app.get("/api/feed/{page}")
-async def scrape_feed(page: int):
+    target = "https://desihub.sh/feed"
+
+    result = await fetch_page(target)
+
+    parsed = parse_page(
+        result["html"],
+        result["url"]
+    )
+
+    return {
+        "source": target,
+        "status": result["status"],
+        "final_url": result["url"],
+        **parsed
+    }
+
+
+@app.get("/api/feed/{page:int}")
+async def feed_page(page: int):
+
+    if page < 2:
+        return {
+            "error": "Use /api/feed for the first page. Numbered pages start at /2."
+        }
 
     target = f"https://desihub.sh/feed/{page}"
 
