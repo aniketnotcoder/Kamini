@@ -37,6 +37,8 @@ SLUG_CLEAN_PATTERN = re.compile(r"[^a-z0-9]+")
 
 PAGE_PATH_PATTERN = re.compile(r"/feed/page/(\d+)(?:/)?$", re.IGNORECASE)
 
+GENERIC_PAGE_PATH_PATTERN = re.compile(r"/page/(\d+)(?:/)?$", re.IGNORECASE)
+
 MEDIA_TYPES = {"video", "image"}
 
 
@@ -193,6 +195,21 @@ def extract_page_number_from_url(url: Any) -> Optional[int]:
     parsed = urlparse(value)
     path = parsed.path or value
     match = PAGE_PATH_PATTERN.search(path.rstrip("/"))
+    if not match:
+        return None
+
+    return _safe_int(match.group(1))
+
+
+def extract_generic_page_number_from_url(url: Any) -> Optional[int]:
+    """Extract a trailing /page/N from any Desihub listing URL."""
+    value = _clean_string(url)
+    if not value:
+        return None
+
+    parsed = urlparse(value)
+    path = parsed.path or value
+    match = GENERIC_PAGE_PATH_PATTERN.search(path.rstrip("/"))
     if not match:
         return None
 
@@ -1355,20 +1372,89 @@ def parse_page(
 # -----------------------------------------------------------------------------
 
 
+def _extract_listing_card_items(html: str, base_url: str) -> List[Dict[str, Any]]:
+    """
+    Fallback parser for listing pages whose cards are rendered in HTML but do
+    not expose standard RSC `feed` objects.
+
+    Search results observed in the captured Desihub HTML use `/post/<slug>`
+    anchors.  We preserve the card's title/thumbnail without pretending that
+    the thumbnail is the complete post media set.
+    """
+    soup = _soup(html)
+    result: List[Dict[str, Any]] = []
+    seen = set()
+
+    for anchor in soup.find_all("a", href=True):
+        href = _clean_string(anchor.get("href")) or ""
+        parsed = urlparse(href)
+        path = parsed.path.strip("/")
+        if not path.startswith("post/"):
+            continue
+
+        slug = normalize_slug(path[5:])
+        if not slug or slug_key(slug) in seen:
+            continue
+
+        title = None
+        image_url = None
+
+        for image in anchor.find_all("img"):
+            alt = _clean_string(image.get("alt"))
+            if alt and not title:
+                title = alt
+            source = _dom_image_source(image)
+            if source and not image_url:
+                image_url = source
+
+        if not title:
+            title = _clean_string(anchor.get_text(" ", strip=True))
+
+        if not title:
+            continue
+
+        item: Dict[str, Any] = {
+            "title": title,
+            "slug": slug,
+            "url": absolute_url(href, base_url),
+            "type": "unknown",
+            "media_count": 0,
+            "video_count": 0,
+            "image_count": 0,
+            "media": [],
+            "embed_url": None,
+            "video_id": None,
+            "video_url": None,
+            "thumbnail": image_url,
+            "duration": None,
+        }
+
+        result.append(item)
+        seen.add(slug_key(slug))
+
+    return result
+
+
 def parse_listing_page(
     html: str,
     base_url: str,
     current_page: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
-    Parse a Desihub listing-style page using the same RSC feed-object
-    normalizer as the main feed endpoint.
+    Parse a Desihub listing-style page.
 
-    This is intentionally generic because tag pages, channel pages, and the
-    search page all render recommendation/listing cards as the same `feed`
-    objects in the Flight payload.
+    Channel/tag pages normally expose the same RSC `feed` objects as `/feed`.
+    Search can instead render `/post/<slug>` cards without those objects, so a
+    DOM card fallback is retained specifically for that case.
     """
     parsed = parse_page(html, base_url, current_page=current_page)
+
+    if not parsed.get("items"):
+        card_items = _extract_listing_card_items(html, base_url)
+        if card_items:
+            parsed["items"] = card_items
+            parsed["count"] = len(card_items)
+
     parsed["source"] = base_url
     return parsed
 
@@ -1858,6 +1944,7 @@ __all__ = [
     "extract_next_f_payloads",
     "extract_next_f_segments",
     "extract_page_number_from_url",
+    "extract_generic_page_number_from_url",
     "extract_pagination",
     "extract_rsc_feed_objects",
     "extract_rsc_media",
