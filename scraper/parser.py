@@ -44,91 +44,294 @@ def decode_next_string(value):
 
     return html_lib.unescape(value)
 
-
 def extract_next_video_data(source_html):
     """
-    Extract Desihub media information from Next.js RSC data.
+    Extract media information from the Next.js RSC payload.
 
-    Expected fields:
-      videoId
-      videoUrl
-      thumbnailUrl
-      duration
+    Desihub serializes feed data roughly like:
+
+        "mediaItems":[
+            {
+                "id":"...",
+                "type":"video",
+                "url":"https://downloaddirect.xyz/embed/...",
+                "videoId":"...",
+                "videoUrl":"https://videos.downloaddirect.xyz/....mp4",
+                "thumbnailUrl":"https://images.downloaddirect.xyz/....webp",
+                "duration":957
+            }
+        ]
+
+    The RSC payload may be escaped, so normalize the quotes first.
     """
 
     data = {}
 
-    # Find every videoId in the page source.
-    video_matches = list(
-        re.finditer(
-            r'"videoId"\s*:\s*"([^"]+)"',
-            source_html,
-            re.DOTALL,
-        )
+    if not source_html:
+        return data
+
+    # ---------------------------------------------------------
+    # Normalize Next.js escaped JSON
+    # ---------------------------------------------------------
+
+    source = source_html
+
+    source = source.replace('\\"', '"')
+    source = source.replace("\\/", "/")
+    source = source.replace("\\u0026", "&")
+    source = source.replace("\\u002F", "/")
+
+    # ---------------------------------------------------------
+    # Extract mediaItems objects
+    # ---------------------------------------------------------
+
+    pattern = re.compile(
+        r'"mediaItems"\s*:\s*\[\s*\{(.*?)\}\s*\]',
+        re.DOTALL,
     )
 
-    for match in video_matches:
-        video_id = decode_next_string(match.group(1))
+    media_blocks = pattern.findall(source)
+
+    for block in media_blocks:
+
+        # -----------------------------------------------------
+        # videoId
+        # -----------------------------------------------------
+
+        video_id_match = re.search(
+            r'"videoId"\s*:\s*"([^"]+)"',
+            block,
+        )
+
+        if not video_id_match:
+            continue
+
+        video_id = clean_text(
+            video_id_match.group(1)
+        )
 
         if not video_id:
             continue
 
-        # Only inspect a reasonable area around this video object.
-        start = match.start()
-        end = min(len(source_html), start + 5000)
+        # -----------------------------------------------------
+        # embed URL
+        # -----------------------------------------------------
 
-        block = source_html[start:end]
+        embed_match = re.search(
+            r'"url"\s*:\s*"([^"]+)"',
+            block,
+        )
+
+        embed_url = (
+            decode_next_string(
+                embed_match.group(1)
+            )
+            if embed_match
+            else None
+        )
+
+        # -----------------------------------------------------
+        # direct video URL
+        # -----------------------------------------------------
 
         video_url_match = re.search(
             r'"videoUrl"\s*:\s*"([^"]+)"',
             block,
-            re.DOTALL,
         )
+
+        video_url = (
+            decode_next_string(
+                video_url_match.group(1)
+            )
+            if video_url_match
+            else None
+        )
+
+        # -----------------------------------------------------
+        # thumbnail
+        # -----------------------------------------------------
 
         thumbnail_match = re.search(
             r'"thumbnailUrl"\s*:\s*"([^"]+)"',
             block,
-            re.DOTALL,
         )
+
+        thumbnail = (
+            decode_next_string(
+                thumbnail_match.group(1)
+            )
+            if thumbnail_match
+            else None
+        )
+
+        # -----------------------------------------------------
+        # duration
+        # -----------------------------------------------------
 
         duration_match = re.search(
-            r'"duration"\s*:\s*(\d+)',
+            r'"duration"\s*:\s*(\d+(?:\.\d+)?)',
             block,
-            re.DOTALL,
         )
 
-        embed_match = re.search(
-            r'"url"\s*:\s*"([^"]*?/embed/[^"]+)"',
-            block,
-            re.DOTALL,
-        )
+        duration = None
+
+        if duration_match:
+            try:
+                duration = int(
+                    float(duration_match.group(1))
+                )
+            except (TypeError, ValueError):
+                duration = None
+
+        # -----------------------------------------------------
+        # Save
+        # -----------------------------------------------------
 
         data[video_id] = {
             "video_id": video_id,
-            "video_url": (
-                decode_next_string(video_url_match.group(1))
-                if video_url_match
-                else None
-            ),
-            "thumbnail": (
-                decode_next_string(thumbnail_match.group(1))
-                if thumbnail_match
-                else None
-            ),
-            "duration": (
-                int(duration_match.group(1))
-                if duration_match
-                else None
-            ),
-            "embed_url": (
-                decode_next_string(embed_match.group(1))
-                if embed_match
-                else None
-            ),
+            "video_url": video_url,
+            "thumbnail": thumbnail,
+            "duration": duration,
+            "embed_url": embed_url,
         }
 
     return data
 
+def extract_media_fallback(source_html):
+    """
+    Fallback extraction for cases where the mediaItems object
+    cannot be matched cleanly.
+    """
+
+    data = {}
+
+    if not source_html:
+        return data
+
+    source = source_html
+
+    source = source.replace('\\"', '"')
+    source = source.replace("\\/", "/")
+    source = source.replace("\\u0026", "&")
+    source = source.replace("\\u002F", "/")
+
+    # Find video URLs directly.
+    video_urls = re.findall(
+        r'"videoUrl"\s*:\s*"([^"]+)"',
+        source,
+    )
+
+    for video_url in video_urls:
+
+        video_url = decode_next_string(
+            video_url
+        )
+
+        if not video_url:
+            continue
+
+        # UUID is part of the video filename.
+        match = re.search(
+            r'/([0-9a-fA-F-]{36})\.mp4',
+            video_url,
+        )
+
+        if not match:
+            continue
+
+        video_id = match.group(1)
+
+        data.setdefault(
+            video_id,
+            {
+                "video_id": video_id,
+                "video_url": video_url,
+                "thumbnail": None,
+                "duration": None,
+                "embed_url": (
+                    f"https://downloaddirect.xyz/embed/{video_id}"
+                ),
+            },
+        )
+
+    # Find thumbnails and pair them using their surrounding
+    # media object whenever possible.
+    thumbnail_matches = re.finditer(
+        r'"thumbnailUrl"\s*:\s*"([^"]+)"',
+        source,
+    )
+
+    for match in thumbnail_matches:
+
+        thumbnail = decode_next_string(
+            match.group(1)
+        )
+
+        # Search nearby for videoId.
+        start = max(
+            0,
+            match.start() - 1500,
+        )
+
+        end = min(
+            len(source),
+            match.end() + 1500,
+        )
+
+        nearby = source[start:end]
+
+        video_id_match = re.search(
+            r'"videoId"\s*:\s*"([^"]+)"',
+            nearby,
+        )
+
+        if not video_id_match:
+            continue
+
+        video_id = video_id_match.group(1)
+
+        if video_id in data:
+            data[video_id]["thumbnail"] = thumbnail
+
+    # Durations
+    duration_matches = re.finditer(
+        r'"duration"\s*:\s*(\d+(?:\.\d+)?)',
+        source,
+    )
+
+    for match in duration_matches:
+
+        start = max(
+            0,
+            match.start() - 1500,
+        )
+
+        end = min(
+            len(source),
+            match.end() + 500,
+        )
+
+        nearby = source[start:end]
+
+        video_id_match = re.search(
+            r'"videoId"\s*:\s*"([^"]+)"',
+            nearby,
+        )
+
+        if not video_id_match:
+            continue
+
+        video_id = video_id_match.group(1)
+
+        if video_id in data:
+            try:
+                data[video_id]["duration"] = int(
+                    float(match.group(1))
+                )
+            except (TypeError, ValueError):
+                pass
+
+    return data
 
 def extract_video_id(embed_url):
     if not embed_url:
@@ -322,9 +525,15 @@ def parse_page(source_html, page_url):
     # ---------------------------------------------------------
 
     media_data = extract_next_video_data(
+    source_html
+)
+
+# Fallback if the RSC mediaItems parser didn't
+# recover anything.
+if not media_data:
+    media_data = extract_media_fallback(
         source_html
     )
-
     # ---------------------------------------------------------
     # FEED POSTS
     # ---------------------------------------------------------
