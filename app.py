@@ -657,6 +657,56 @@ async def channel_page_number(
 
 
 @app.get("/api/post/{slug:path}")
+async def _enrich_post_recommendations(
+    recommendations: Any,
+) -> List[Dict[str, Any]]:
+    """Resolve lightweight /post recommendations through their rich Feed route.
+
+    Direct /post pages often serialize recommendation cards without channel/media
+    metadata. The older Feed post family still exposes the complete feed object,
+    so use /feed/<slug> first and /post/<slug> only as a fallback.
+    """
+    if not isinstance(recommendations, list) or not recommendations:
+        return recommendations if isinstance(recommendations, list) else []
+
+    semaphore = asyncio.Semaphore(4)
+
+    async def resolve(item: Dict[str, Any]) -> Dict[str, Any]:
+        slug = normalize_requested_slug(item.get("slug"))
+        if not slug:
+            return item
+
+        async with semaphore:
+            for route_hint in ("feed", "post"):
+                target = f"{BASE_URL}/{route_hint}/{quote(slug, safe='-')}"
+                try:
+                    result = await fetch_page(target)
+                    html = result.get("html") or ""
+                    if not html:
+                        continue
+                    parsed = parse_post_page(
+                        html, slug, BASE_URL, route_hint=route_hint
+                    )
+                    if not parsed:
+                        continue
+                    # A recommendation must stay a flat card. Do not nest its
+                    # own recommendation tree into the parent response.
+                    enriched = dict(item)
+                    enriched.update(parsed)
+                    enriched.pop("recommendations", None)
+                    enriched.pop("recommendation_count", None)
+                    enriched["slug"] = slug
+                    enriched["url"] = target
+                    return enriched
+                except Exception:
+                    continue
+
+        return item
+
+    tasks = [resolve(item) if isinstance(item, dict) else resolve({}) for item in recommendations]
+    return await asyncio.gather(*tasks)
+
+
 async def post_page(request: Request, slug: str) -> Dict[str, Any]:
     """Scrape one individual upstream post page directly."""
     requested_slug = normalize_requested_slug(slug)
@@ -687,6 +737,12 @@ async def post_page(request: Request, slug: str) -> Dict[str, Any]:
             continue
 
         if parsed is not None:
+            if detect_post_route(target_url) == "post" and parsed.get("recommendations"):
+                parsed["recommendations"] = await _enrich_post_recommendations(
+                    parsed.get("recommendations")
+                )
+                parsed["recommendation_count"] = len(parsed["recommendations"])
+
             return {
                 **parsed,
                 "source": target_url,
