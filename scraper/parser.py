@@ -1765,7 +1765,7 @@ def _build_dom_post_object(
 
 def _find_dom_post_match(html: str, requested_slug: str, base_url: str) -> Optional[Dict[str, Any]]:
     """
-    Parse the actual direct `/feed/<slug>` page.
+    Parse the actual direct `/post/<slug>` page.
 
     This is intentionally NOT a feed-card parser.  Individual post pages do
     not render the main post as an `<a href="/feed/<slug>">` card.  Instead the
@@ -1863,11 +1863,11 @@ def parse_post_page(
     base_url: str,
 ) -> Optional[Dict[str, Any]]:
     """
-    Parse one individual `/feed/<slug>` page.
+    Parse one individual `/post/<slug>` page.
 
     Important architecture:
         * Feed pages (`/feed`, `/feed/page/N`) use RSC feed objects.
-        * Individual post pages (`/feed/<slug>`) are parsed from their direct
+        * Individual post pages (`/post/<slug>`) are parsed from their direct
           rendered HTML first.  The main post is not a normal `feed` RSC object;
           the RSC feed objects on that page are recommendation cards.
 
