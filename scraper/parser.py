@@ -42,7 +42,10 @@ def decode_next_string(value):
     value = value.replace("\\u002F", "/")
 
     try:
-        value = bytes(value, "utf-8").decode("unicode_escape")
+        value = bytes(
+            value,
+            "utf-8",
+        ).decode("unicode_escape")
     except Exception:
         pass
 
@@ -54,11 +57,6 @@ def decode_next_string(value):
 # ============================================================
 
 def normalize_rsc_source(source_html):
-    """
-    Normalize the escaped strings used inside Next.js
-    React Server Component payloads.
-    """
-
     source = source_html or ""
 
     source = source.replace('\\"', '"')
@@ -72,20 +70,6 @@ def normalize_rsc_source(source_html):
 def extract_next_video_data(source_html):
     """
     Extract Desihub video metadata from the Next.js RSC payload.
-
-    Desihub contains objects similar to:
-
-        "mediaItems":[
-            {
-                "id":"...",
-                "type":"video",
-                "url":"https://downloaddirect.xyz/embed/...",
-                "videoId":"UUID",
-                "videoUrl":"https://videos.downloaddirect.xyz/UUID.mp4",
-                "thumbnailUrl":"https://images.downloaddirect.xyz/IMAGE.webp",
-                "duration":123
-            }
-        ]
     """
 
     data = {}
@@ -93,12 +77,12 @@ def extract_next_video_data(source_html):
     if not source_html:
         return data
 
-    source = normalize_rsc_source(source_html)
+    source = normalize_rsc_source(
+        source_html
+    )
 
     # --------------------------------------------------------
     # METHOD 1
-    #
-    # Match the mediaItems object itself.
     # --------------------------------------------------------
 
     media_pattern = re.compile(
@@ -106,7 +90,9 @@ def extract_next_video_data(source_html):
         re.DOTALL,
     )
 
-    media_blocks = media_pattern.findall(source)
+    media_blocks = media_pattern.findall(
+        source
+    )
 
     for block in media_blocks:
 
@@ -178,7 +164,10 @@ def extract_next_video_data(source_html):
                         duration_match.group(1)
                     )
                 )
-            except (TypeError, ValueError):
+            except (
+                TypeError,
+                ValueError,
+            ):
                 duration = None
 
         data[video_id] = {
@@ -191,12 +180,6 @@ def extract_next_video_data(source_html):
 
     # --------------------------------------------------------
     # METHOD 2
-    #
-    # More tolerant fallback.
-    #
-    # This does NOT depend on mediaItems being matched
-    # perfectly. It finds videoId and searches nearby for
-    # the other fields.
     # --------------------------------------------------------
 
     if not data:
@@ -218,16 +201,16 @@ def extract_next_video_data(source_html):
             if not video_id:
                 continue
 
-            # The fields in a mediaItems object are very close
-            # together, but allow a generous window because
-            # Next.js RSC serialization can vary.
             start = match.start()
+
             end = min(
                 len(source),
                 start + 4000,
             )
 
-            block = source[start:end]
+            block = source[
+                start:end
+            ]
 
             video_url_match = re.search(
                 r'"videoUrl"\s*:\s*"([^"]+)"',
@@ -255,6 +238,7 @@ def extract_next_video_data(source_html):
 
             data[video_id] = {
                 "video_id": video_id,
+
                 "video_url": (
                     decode_next_string(
                         video_url_match.group(1)
@@ -262,6 +246,7 @@ def extract_next_video_data(source_html):
                     if video_url_match
                     else None
                 ),
+
                 "thumbnail": (
                     decode_next_string(
                         thumbnail_match.group(1)
@@ -269,6 +254,7 @@ def extract_next_video_data(source_html):
                     if thumbnail_match
                     else None
                 ),
+
                 "duration": (
                     int(
                         float(
@@ -278,6 +264,7 @@ def extract_next_video_data(source_html):
                     if duration_match
                     else None
                 ),
+
                 "embed_url": (
                     decode_next_string(
                         embed_match.group(1)
@@ -291,23 +278,19 @@ def extract_next_video_data(source_html):
 
 
 # ============================================================
-# EXTRA FALLBACK MEDIA EXTRACTOR
+# EXTRA MEDIA FALLBACK
 # ============================================================
 
 def extract_media_fallback(source_html):
-    """
-    Final fallback for direct video URLs.
-
-    This is only used when the main RSC parser does not
-    recover media information.
-    """
 
     data = {}
 
     if not source_html:
         return data
 
-    source = normalize_rsc_source(source_html)
+    source = normalize_rsc_source(
+        source_html
+    )
 
     # --------------------------------------------------------
     # Direct video URLs
@@ -376,7 +359,9 @@ def extract_media_fallback(source_html):
             match.end() + 1500,
         )
 
-        nearby = source[start:end]
+        nearby = source[
+            start:end
+        ]
 
         video_id_match = re.search(
             r'"videoId"\s*:\s*"([^"]+)"',
@@ -389,7 +374,9 @@ def extract_media_fallback(source_html):
         video_id = video_id_match.group(1)
 
         if video_id in data:
-            data[video_id]["thumbnail"] = thumbnail
+            data[video_id][
+                "thumbnail"
+            ] = thumbnail
 
     # --------------------------------------------------------
     # Durations
@@ -412,7 +399,9 @@ def extract_media_fallback(source_html):
             match.end() + 500,
         )
 
-        nearby = source[start:end]
+        nearby = source[
+            start:end
+        ]
 
         video_id_match = re.search(
             r'"videoId"\s*:\s*"([^"]+)"',
@@ -428,12 +417,17 @@ def extract_media_fallback(source_html):
             continue
 
         try:
-            data[video_id]["duration"] = int(
+            data[video_id][
+                "duration"
+            ] = int(
                 float(
                     match.group(1)
                 )
             )
-        except (TypeError, ValueError):
+        except (
+            TypeError,
+            ValueError,
+        ):
             pass
 
     return data
@@ -444,12 +438,17 @@ def extract_media_fallback(source_html):
 # ============================================================
 
 def extract_video_id(embed_url):
+
     if not embed_url:
         return None
 
-    parsed = urlparse(embed_url)
+    parsed = urlparse(
+        embed_url
+    )
 
-    path = parsed.path.rstrip("/")
+    path = parsed.path.rstrip(
+        "/"
+    )
 
     match = re.search(
         r"/embed/([^/?#]+)",
@@ -467,7 +466,10 @@ def extract_video_id(embed_url):
 # CHANNEL
 # ============================================================
 
-def extract_channel_data(post_link, base_url):
+def extract_channel_data(
+    post_link,
+    base_url,
+):
 
     channel = {
         "name": None,
@@ -481,22 +483,27 @@ def extract_channel_data(post_link, base_url):
     if not parent:
         return channel
 
-    # Search current card/container.
     candidates = parent.find_all(
         "a",
         href=True,
     )
 
-    # Search one level higher if necessary.
-    if not candidates and parent.parent:
-        candidates = parent.parent.find_all(
-            "a",
-            href=True,
+    if (
+        not candidates
+        and parent.parent
+    ):
+        candidates = (
+            parent.parent.find_all(
+                "a",
+                href=True,
+            )
         )
 
     for link in candidates:
 
-        href = link.get("href")
+        href = link.get(
+            "href"
+        )
 
         if not href:
             continue
@@ -516,13 +523,20 @@ def extract_channel_data(post_link, base_url):
             )
         )
 
-        image = link.find("img")
+        image = link.find(
+            "img"
+        )
 
         if image:
-            channel["avatar"] = absolute_url(
+
+            channel[
+                "avatar"
+            ] = absolute_url(
                 image.get("src")
                 or image.get("data-src")
-                or image.get("data-lazy-src"),
+                or image.get(
+                    "data-lazy-src"
+                ),
                 base_url,
             )
 
@@ -530,21 +544,30 @@ def extract_channel_data(post_link, base_url):
 
             if "@" in text:
 
-                name, username = text.rsplit(
-                    "@",
-                    1,
+                name, username = (
+                    text.rsplit(
+                        "@",
+                        1,
+                    )
                 )
 
-                channel["name"] = clean_text(
+                channel[
+                    "name"
+                ] = clean_text(
                     name
                 )
 
-                channel["username"] = clean_text(
+                channel[
+                    "username"
+                ] = clean_text(
                     "@" + username
                 )
 
             else:
-                channel["name"] = text
+
+                channel[
+                    "name"
+                ] = text
 
         break
 
@@ -555,7 +578,11 @@ def extract_channel_data(post_link, base_url):
 # PAGINATION
 # ============================================================
 
-def extract_pagination(soup, base_url, current_page):
+def extract_pagination(
+    soup,
+    base_url,
+    current_page,
+):
 
     next_url = None
     previous_url = None
@@ -567,12 +594,14 @@ def extract_pagination(soup, base_url, current_page):
     if current_page > 1:
 
         if current_page == 2:
+
             previous_url = urljoin(
                 base_url,
                 "/feed",
             )
 
         else:
+
             previous_url = urljoin(
                 base_url,
                 f"/feed/page/{current_page - 1}",
@@ -582,10 +611,8 @@ def extract_pagination(soup, base_url, current_page):
     # Next page
     # --------------------------------------------------------
 
-    # Look for an actual numbered feed page link.
-    # If page N+1 exists, use it.
     expected_next = (
-        "/feed"
+        "/feed/page/2"
         if current_page == 1
         else f"/feed/page/{current_page + 1}"
     )
@@ -595,34 +622,31 @@ def extract_pagination(soup, base_url, current_page):
         href=True,
     ):
 
-        href = link.get("href")
+        href = link.get(
+            "href"
+        )
 
         if not href:
             continue
 
-        parsed_href = urlparse(href)
+        parsed_href = urlparse(
+            href
+        )
 
-        path = parsed_href.path.rstrip("/")
+        path = (
+            parsed_href.path.rstrip(
+                "/"
+            )
+        )
 
-        # Page 1 -> /feed/page/2
-        if current_page == 1:
+        if path == expected_next:
 
-            if path == "/feed/page/2":
-                next_url = absolute_url(
-                    href,
-                    base_url,
-                )
-                break
+            next_url = absolute_url(
+                href,
+                base_url,
+            )
 
-        # Page 2+ -> /feed/page/N+1
-        else:
-
-            if path == expected_next:
-                next_url = absolute_url(
-                    href,
-                    base_url,
-                )
-                break
+            break
 
     return {
         "next": next_url,
@@ -634,7 +658,9 @@ def extract_pagination(soup, base_url, current_page):
 # PAGE NUMBER
 # ============================================================
 
-def extract_page_number(page_url):
+def extract_page_number(
+    page_url,
+):
 
     match = re.search(
         r"/feed/page/(\d+)",
@@ -643,16 +669,22 @@ def extract_page_number(page_url):
     )
 
     if match:
+
         return int(
             match.group(1)
         )
 
     return 1
+
+
 # ============================================================
 # MAIN PAGE PARSER
 # ============================================================
 
-def parse_page(source_html, page_url):
+def parse_page(
+    source_html,
+    page_url,
+):
 
     soup = BeautifulSoup(
         source_html,
@@ -678,15 +710,20 @@ def parse_page(source_html, page_url):
     # NEXT.JS MEDIA DATA
     # ========================================================
 
-    media_data = extract_next_video_data(
-        source_html
+    media_data = (
+        extract_next_video_data(
+            source_html
+        )
     )
 
-    # Final fallback.
+    # Fallback if necessary.
+
     if not media_data:
 
-        media_data = extract_media_fallback(
-            source_html
+        media_data = (
+            extract_media_fallback(
+                source_html
+            )
         )
 
     # ========================================================
@@ -700,7 +737,9 @@ def parse_page(source_html, page_url):
         href=True,
     ):
 
-        href = link.get("href")
+        href = link.get(
+            "href"
+        )
 
         if not href:
             continue
@@ -709,10 +748,9 @@ def parse_page(source_html, page_url):
         #
         # /feed/something
         #
-        # but NOT:
+        # But NOT:
         #
         # /feed/page/2
-        #
 
         if not re.match(
             r"^/feed/(?!page/)[^/?#]+",
@@ -721,7 +759,9 @@ def parse_page(source_html, page_url):
         ):
             continue
 
-        post_links.append(link)
+        post_links.append(
+            link
+        )
 
     # ========================================================
     # ITEMS
@@ -732,7 +772,9 @@ def parse_page(source_html, page_url):
 
     for post_link in post_links:
 
-        href = post_link.get("href")
+        href = post_link.get(
+            "href"
+        )
 
         post_url = absolute_url(
             href,
@@ -745,13 +787,17 @@ def parse_page(source_html, page_url):
         if post_url in seen_urls:
             continue
 
-        seen_urls.add(post_url)
+        seen_urls.add(
+            post_url
+        )
 
         # ----------------------------------------------------
         # TITLE
         # ----------------------------------------------------
 
-        heading = post_link.find("h2")
+        heading = post_link.find(
+            "h2"
+        )
 
         if heading:
 
@@ -813,9 +859,11 @@ def parse_page(source_html, page_url):
         # CHANNEL
         # ----------------------------------------------------
 
-        channel = extract_channel_data(
-            post_link,
-            page_url,
+        channel = (
+            extract_channel_data(
+                post_link,
+                page_url,
+            )
         )
 
         # ----------------------------------------------------
@@ -825,6 +873,7 @@ def parse_page(source_html, page_url):
         items.append(
             {
                 "title": item_title,
+
                 "url": post_url,
 
                 "channel": channel,
@@ -834,66 +883,49 @@ def parse_page(source_html, page_url):
                 "video_id": video_id,
 
                 "video_url": (
-                    media.get("video_url")
+                    media.get(
+                        "video_url"
+                    )
                     if media
                     else None
                 ),
 
                 "thumbnail": (
-                    media.get("thumbnail")
+                    media.get(
+                        "thumbnail"
+                    )
                     if media
                     else None
                 ),
 
                 "duration": (
-                    media.get("duration")
+                    media.get(
+                        "duration"
+                    )
                     if media
                     else None
                 ),
             }
         )
 
-# ========================================================
-# PAGINATION
-# ========================================================
+    # ========================================================
+    # PAGINATION
+    # ========================================================
 
-current_page = extract_page_number(
-    page_url
-)
+    current_page = (
+        extract_page_number(
+            page_url
+        )
+    )
 
-pagination = extract_pagination(
-    soup,
-    page_url,
-    current_page,
-)
+    pagination = (
+        extract_pagination(
+            soup,
+            page_url,
+            current_page,
+        )
+    )
 
-# Page 2+ previous-page fallback.
-
-if (
-    not pagination["previous"]
-    and current_page > 1
-    ):
-
-        if current_page == 2:
-
-            pagination["previous"] = (
-                urljoin(
-                    page_url,
-                    "/feed",
-                )
-            )
-
-        else:
-
-            pagination["previous"] = (
-                urljoin(
-                    page_url,
-                    f"/feed/page/{current_page - 1}",
-                )
-            )
-
-    if not pagination["next"]:
-        pagination["next"] = None        
     # ========================================================
     # RESULT
     # ========================================================
