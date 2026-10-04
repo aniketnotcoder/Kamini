@@ -23,13 +23,14 @@ There is intentionally no database/cache layer in this phase.
 from __future__ import annotations
 
 import asyncio
+import httpx
 import re
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, unquote, urlparse
 
 from fastapi import FastAPI, HTTPException, Request
 
-from fetcher import fetch_page
+from fetcher import DEFAULT_HEADERS, fetch_page
 from scraper.parser import (
     extract_embed_video_metadata,
     extract_generic_page_number_from_url,
@@ -486,6 +487,98 @@ async def enrich_search_results(items: Any) -> List[Dict[str, Any]]:
 # -----------------------------------------------------------------------------
 
 
+async def _fetch_mp4_duration(video_url: str) -> int | None:
+    """Read MP4 movie metadata with small HTTP range requests.
+
+    This is only a fallback when the embed page does not expose duration.
+    It never downloads the complete video intentionally.
+    """
+    if not video_url:
+        return None
+
+    timeout = httpx.Timeout(connect=10.0, read=15.0, write=10.0, pool=10.0)
+    headers = {
+        "User-Agent": DEFAULT_HEADERS.get("User-Agent", "Mozilla/5.0"),
+        "Range": "bytes=0-2097151",
+        "Accept": "video/mp4,video/*;q=0.9,*/*;q=0.8",
+    }
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, http2=False) as client:
+        try:
+            async with client.stream("GET", video_url, headers=headers) as response:
+                if response.status_code not in (200, 206):
+                    return None
+                data = await response.aread()
+                data = data[:2097152]
+        except Exception:
+            return None
+
+    duration = _parse_mp4_mvhd_duration(data)
+    if duration is not None:
+        return duration
+
+    # Fast-start MP4s normally put `moov` near the beginning. For files where
+    # it is at the end, make one bounded tail request when Content-Length is
+    # available.
+    try:
+        timeout = httpx.Timeout(connect=10.0, read=15.0, write=10.0, pool=10.0)
+        async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, http2=False) as client:
+            head = await client.head(video_url, headers={"User-Agent": DEFAULT_HEADERS.get("User-Agent", "Mozilla/5.0")})
+            total = int(head.headers.get("content-length", "0") or 0)
+            if total <= 2097152:
+                return None
+            start = max(0, total - 2097152)
+            async with client.stream(
+                "GET",
+                video_url,
+                headers={
+                    "User-Agent": DEFAULT_HEADERS.get("User-Agent", "Mozilla/5.0"),
+                    "Range": f"bytes={start}-{total - 1}",
+                },
+            ) as response:
+                if response.status_code not in (200, 206):
+                    return None
+                tail = (await response.aread())[:2097152]
+    except Exception:
+        return None
+
+    return _parse_mp4_mvhd_duration(tail)
+
+
+def _parse_mp4_mvhd_duration(data: bytes) -> int | None:
+    """Extract integer seconds from an MP4 mvhd atom when present."""
+    if not data:
+        return None
+
+    pos = 0
+    length = len(data)
+    while pos + 8 <= length:
+        idx = data.find(b"mvhd", pos)
+        if idx < 0 or idx + 24 > length:
+            return None
+
+        version = data[idx + 4]
+        try:
+            if version == 0 and idx + 24 <= length:
+                timescale = int.from_bytes(data[idx + 16:idx + 20], "big")
+                duration = int.from_bytes(data[idx + 20:idx + 24], "big")
+            elif version == 1 and idx + 40 <= length:
+                timescale = int.from_bytes(data[idx + 28:idx + 32], "big")
+                duration = int.from_bytes(data[idx + 32:idx + 40], "big")
+            else:
+                pos = idx + 4
+                continue
+        except Exception:
+            pos = idx + 4
+            continue
+
+        if timescale > 0 and duration >= 0:
+            return int(duration / timescale)
+        pos = idx + 4
+
+    return None
+
+
 async def _enrich_feed_media_item(
     item: Dict[str, Any],
     semaphore: asyncio.Semaphore,
@@ -520,6 +613,14 @@ async def _enrich_feed_media_item(
         enriched["thumbnail"] = metadata["thumbnail"]
     if metadata.get("duration") is not None:
         enriched["duration"] = metadata["duration"]
+
+    # Some Downloaddirect embed revisions expose poster/MP4 but omit duration.
+    # Read the MP4 mvhd atom as a bounded fallback; this does not affect the
+    # recommendation extraction or any other endpoint.
+    if enriched.get("duration") is None and enriched.get("video_url"):
+        duration = await _fetch_mp4_duration(str(enriched["video_url"]))
+        if duration is not None:
+            enriched["duration"] = duration
 
     return enriched
 
