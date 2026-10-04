@@ -1,236 +1,385 @@
+"""
+Desihub parser.
+
+This module intentionally does not persist anything.  It fetches one HTML page,
+extracts the server-rendered feed objects from the Next.js Flight/RSC payload,
+normalizes media, and returns JSON-safe dictionaries.
+
+Important implementation detail
+--------------------------------
+Next.js embeds Flight data in multiple self.__next_f.push([1, "..."]) chunks.
+A large Flight row can be split in the middle of a JSON object, so individual
+chunks must never be parsed as complete rows.  We first JSON-decode every type-1
+chunk and concatenate them into the Flight stream.  Feed objects are then found
+by the literal `"feed":` property and balanced-brace extraction.
+"""
+
 from __future__ import annotations
 
+import html as html_lib
 import json
 import re
-from typing import (
-    Any,
-    Dict,
-    Iterable,
-    List,
-    Optional,
-    Set,
-    Tuple,
-)
-from urllib.parse import (
-    unquote,
-    urljoin,
-    urlparse,
-)
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from urllib.parse import unquote, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
 
-# ---------------------------------------------------------------------------
-# Next.js / React Server Components
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Constants
+# -----------------------------------------------------------------------------
 
-NEXT_F_PUSH_PATTERN = re.compile(
-    r"""
-    self\.__next_f\.push
-    \(
-        \[
-            \s*1\s*,\s*
-            (?P<payload>"(?:\\.|[^"\\])*")
-        \]
-    \)
-    """,
-    re.VERBOSE,
-)
+NEXT_F_PUSH_PATTERN = re.compile(r"self\.__next_f\.push\s*\(", re.DOTALL)
+
+FEED_KEY_PATTERN = re.compile(r'"feed"\s*:\s*')
+
+SLUG_CLEAN_PATTERN = re.compile(r"[^a-z0-9]+")
+
+PAGE_PATH_PATTERN = re.compile(r"/feed/page/(\d+)(?:/)?$", re.IGNORECASE)
+
+MEDIA_TYPES = {"video", "image"}
 
 
-FEED_PATH_PATTERN = re.compile(
-    r"^/feed(?:/page/(?P<page>\d+))?(?:/.*)?$",
-    re.IGNORECASE,
-)
+# -----------------------------------------------------------------------------
+# Basic value helpers
+# -----------------------------------------------------------------------------
 
 
-# ---------------------------------------------------------------------------
-# Small helpers
-# ---------------------------------------------------------------------------
-
-def _safe_int(
-    value: Any,
-) -> Optional[int]:
+def _clean_string(value: Any) -> Optional[str]:
+    """Return a stripped string, or None for empty/non-string values."""
     if value is None:
         return None
 
-    if isinstance(
-        value,
-        bool,
-    ):
+    if isinstance(value, str):
+        value = html_lib.unescape(value).strip()
+        return value or None
+
+    return None
+
+
+def _safe_int(value: Any) -> Optional[int]:
+    """Convert a numeric-ish value to int without raising."""
+    if value is None or isinstance(value, bool):
         return None
 
-    try:
+    if isinstance(value, int):
+        return value
+
+    if isinstance(value, float):
         return int(value)
-    except (
-        TypeError,
-        ValueError,
-    ):
-        return None
 
-
-def _clean_string(
-    value: Any,
-) -> Optional[str]:
-    if value is None:
-        return None
-
-    if not isinstance(
-        value,
-        str,
-    ):
-        value = str(value)
-
-    value = value.strip()
-
-    if not value:
-        return None
-
-    return value
-
-
-def _normalize_slug(
-    value: Any,
-) -> Optional[str]:
-    value = _clean_string(
-        value
-    )
-
-    if not value:
-        return None
-
-    value = unquote(
-        value
-    ).strip()
-
-    value = value.strip(
-        "/"
-    )
-
-    if value.startswith(
-        "feed/"
-    ):
-        value = value[5:]
-
-    if "/page/" in value:
-        parts = value.split(
-            "/page/",
-            1,
-        )
-
-        if (
-            len(parts) == 2
-            and parts[1].isdigit()
-        ):
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
             return None
 
-    if "/" in value:
-        value = (
-            value
-            .rstrip("/")
-            .split("/")[-1]
-        )
+    return None
 
+
+def _safe_float(value: Any) -> Optional[float]:
+    """Convert a numeric-ish value to float without raising."""
+    if value is None or isinstance(value, bool):
+        return None
+
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    return None
+
+
+def _first_non_empty(*values: Any) -> Any:
+    """Return the first non-empty value."""
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        if isinstance(value, (list, dict, tuple, set)) and not value:
+            continue
+        return value
+    return None
+
+
+def _dedupe_preserve_order(values: Iterable[Any]) -> List[Any]:
+    """Deduplicate hashable values while preserving order."""
+    result: List[Any] = []
+    seen = set()
+
+    for value in values:
+        try:
+            key = value if isinstance(value, (str, int, float, bool, type(None))) else json.dumps(value, sort_keys=True, default=str)
+        except Exception:
+            key = repr(value)
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        result.append(value)
+
+    return result
+
+
+# -----------------------------------------------------------------------------
+# URL / slug helpers
+# -----------------------------------------------------------------------------
+
+
+def normalize_slug(value: Any) -> Optional[str]:
+    """Normalize a post slug for exact comparison."""
+    value = _clean_string(value)
+    if not value:
+        return None
+
+    value = unquote(value)
+    value = value.strip()
+
+    parsed = urlparse(value)
+    if parsed.scheme and parsed.netloc:
+        value = parsed.path
+
+    value = value.strip("/")
+
+    if value.startswith("feed/"):
+        value = value[5:]
+
+    if value.startswith("feed/page/"):
+        return None
+
+    value = value.strip("/")
     return value or None
 
 
-def _absolute_or_original(
-    url: Any,
-    base_url: str,
-) -> Optional[str]:
-    url = _clean_string(
-        url
-    )
-
-    if not url:
-        return None
-
-    return urljoin(
-        base_url.rstrip("/") + "/",
-        url,
-    )
+def slug_key(value: Any) -> str:
+    """Return a comparison-friendly slug key."""
+    slug = normalize_slug(value)
+    if not slug:
+        return ""
+    return SLUG_CLEAN_PATTERN.sub("-", slug.lower()).strip("-")
 
 
-def _is_http_url(
-    value: Any,
-) -> bool:
-    value = _clean_string(
-        value
-    )
-
+def absolute_url(value: Any, base_url: str) -> Optional[str]:
+    """Turn a relative URL into an absolute URL."""
+    value = _clean_string(value)
     if not value:
-        return False
+        return None
 
-    parsed = urlparse(
-        value
-    )
+    if value.startswith("//"):
+        scheme = urlparse(base_url).scheme or "https"
+        return f"{scheme}:{value}"
 
-    return (
-        parsed.scheme
-        in {
-            "http",
-            "https",
-        }
-        and bool(
-            parsed.netloc
-        )
-    )
+    return urljoin(base_url.rstrip("/") + "/", value)
 
 
-def _extract_balanced_json(
-    text: str,
-    start_index: int,
-) -> Optional[str]:
+def extract_page_number_from_url(url: Any) -> Optional[int]:
+    """Extract /feed/page/N from a URL/path."""
+    value = _clean_string(url)
+    if not value:
+        return None
+
+    parsed = urlparse(value)
+    path = parsed.path or value
+    match = PAGE_PATH_PATTERN.search(path.rstrip("/"))
+    if not match:
+        return None
+
+    return _safe_int(match.group(1))
+
+
+def page_path_for_number(page: int) -> str:
+    """Return the upstream feed path for a page number."""
+    page = max(1, int(page))
+    return "/feed" if page == 1 else f"/feed/page/{page}"
+
+
+# -----------------------------------------------------------------------------
+# Next.js Flight extraction
+# -----------------------------------------------------------------------------
+
+
+def _decode_js_string(raw: str) -> Optional[str]:
+    """Decode a JSON/JavaScript-style quoted string."""
+    raw = raw.strip()
+    if not raw:
+        return None
+
+    try:
+        value = json.loads(raw)
+        return value if isinstance(value, str) else None
+    except Exception:
+        return None
+
+
+def _extract_balanced_js_value(text: str, start: int) -> Optional[str]:
     """
-    Extract a balanced JSON object/array beginning at start_index.
+    Extract one balanced JavaScript array/object expression.
+
+    The scanner understands quoted strings and escaped characters, so a `]` or
+    `}` inside a Flight string does not terminate the expression early.
     """
-
-    if not text:
+    if start < 0 or start >= len(text):
         return None
 
-    if (
-        start_index < 0
-        or start_index >= len(text)
-    ):
+    opening = text[start]
+    if opening not in "[{":
         return None
 
-    opening = text[
-        start_index
-    ]
-
-    if opening not in "{[":
-        return None
-
-    closing = (
-        "}"
-        if opening == "{"
-        else "]"
-    )
-
-    depth = 0
+    stack = ["]" if opening == "[" else "}"]
     in_string = False
     escaped = False
 
-    for index in range(
-        start_index,
-        len(text),
-    ):
-        char = text[
-            index
-        ]
+    for index in range(start + 1, len(text)):
+        char = text[index]
 
         if in_string:
             if escaped:
                 escaped = False
-                continue
-
-            if char == "\\":
+            elif char == "\\":
                 escaped = True
-                continue
-
-            if char == '"':
+            elif char == '"':
                 in_string = False
+            continue
 
+        if char == '"':
+            in_string = True
+            continue
+
+        if char == "[":
+            stack.append("]")
+            continue
+
+        if char == "{":
+            stack.append("}")
+            continue
+
+        if char in ("]", "}"):
+            if not stack or char != stack[-1]:
+                return None
+            stack.pop()
+            if not stack:
+                return text[start:index + 1]
+
+    return None
+
+
+def extract_next_f_segments(html: str) -> List[Tuple[int, str]]:
+    """
+    Extract `(tag, decoded_payload)` from Next.js self.__next_f.push calls.
+
+    We deliberately scan each push expression instead of using a regex that
+    assumes the payload ends at the first `])`.  Flight payload strings can
+    themselves contain brackets, quotes, and very large JSON objects, and
+    Next.js may split those objects across many script tags.
+    """
+    if not html:
+        return []
+
+    segments: List[Tuple[int, str]] = []
+
+    for match in NEXT_F_PUSH_PATTERN.finditer(html):
+        cursor = match.end()
+
+        # Skip whitespace between `push(` and the array expression.
+        while cursor < len(html) and html[cursor].isspace():
+            cursor += 1
+
+        if cursor >= len(html) or html[cursor] != "[":
+            continue
+
+        raw_array = _extract_balanced_js_value(html, cursor)
+        if raw_array is None:
+            continue
+
+        try:
+            parsed = json.loads(raw_array)
+        except Exception:
+            continue
+
+        if not isinstance(parsed, list) or not parsed:
+            continue
+
+        tag = _safe_int(parsed[0])
+        if tag is None:
+            continue
+
+        payload = ""
+        if len(parsed) > 1 and isinstance(parsed[1], str):
+            payload = parsed[1]
+
+        segments.append((tag, payload))
+
+    return segments
+
+def extract_next_f_payloads(html: str) -> List[str]:
+    """Return decoded type-1 Flight payload chunks in source order."""
+    return [payload for tag, payload in extract_next_f_segments(html) if tag == 1]
+
+
+def _flight_stream_from_segments(segments: Sequence[Tuple[int, str]]) -> str:
+    """
+    Reconstruct the type-1 Flight stream.
+
+    Next.js can split a single Flight row/object across multiple script tags.
+    Concatenation is therefore required before searching/parsing JSON objects.
+    """
+    # Type 1 contains the actual Flight data. Type 0 is bootstrap metadata; it
+    # is not a signal to discard already received type-1 chunks. In particular,
+    # discarding earlier chunks can destroy a feed object whose JSON is split
+    # across script tags.
+    return "".join(payload for tag, payload in segments if tag == 1)
+
+
+def combined_rsc_payload(html: str) -> str:
+    """Return the reconstructed Flight/RSC text stream."""
+    return _flight_stream_from_segments(extract_next_f_segments(html))
+
+
+# -----------------------------------------------------------------------------
+# Balanced JSON extraction
+# -----------------------------------------------------------------------------
+
+
+def _extract_balanced_json(text: str, start: int) -> Optional[str]:
+    """
+    Extract one balanced JSON object/array beginning at `start`.
+
+    Braces inside JSON strings are ignored. Escaped quotes are handled.
+    """
+    if start < 0 or start >= len(text):
+        return None
+
+    opening = text[start]
+    if opening not in "[{":
+        return None
+
+    closing = "]" if opening == "[" else "}"
+    depth = 0
+    in_string = False
+    escaped = False
+
+    for index in range(start, len(text)):
+        char = text[index]
+
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
             continue
 
         if char == '"':
@@ -243,1459 +392,1013 @@ def _extract_balanced_json(
 
         if char == closing:
             depth -= 1
-
             if depth == 0:
-                return text[
-                    start_index:index + 1
-                ]
+                return text[start : index + 1]
 
     return None
 
 
-# ---------------------------------------------------------------------------
-# Next.js Flight payload extraction
-# ---------------------------------------------------------------------------
-
-def extract_next_f_payloads(
-    html: str,
-) -> List[str]:
-    """
-    Extract and JSON-decode every self.__next_f.push([1, "..."]) payload.
-
-    Next.js can split one Flight row across multiple script tags, so every
-    decoded chunk is preserved and joined later.
-    """
-
-    if not html:
-        return []
-
-    payloads: List[str] = []
-
-    for match in NEXT_F_PUSH_PATTERN.finditer(
-        html
-    ):
-        raw_payload = match.group(
-            "payload"
-        )
-
-        if not raw_payload:
-            continue
-
-        try:
-            payload = json.loads(
-                raw_payload
-            )
-        except (
-            TypeError,
-            json.JSONDecodeError,
-        ):
-            continue
-
-        if isinstance(
-            payload,
-            str,
-        ):
-            payloads.append(
-                payload
-            )
-
-    return payloads
-
-
-def _combined_rsc_payload(
-    html: str,
-) -> str:
-    return "".join(
-        extract_next_f_payloads(
-            html
-        )
-    )
-
-
-def _parse_rsc_row_value(
-    value: str,
-) -> Optional[Any]:
-    value = value.strip()
-
-    if not value:
-        return None
-
-    if value[0] not in "[{":
+def _parse_json_at(text: str, start: int) -> Any:
+    """Parse a JSON object/array starting at a known position."""
+    raw = _extract_balanced_json(text, start)
+    if raw is None:
         return None
 
     try:
-        return json.loads(
-            value
-        )
-    except (
-        TypeError,
-        json.JSONDecodeError,
-    ):
+        return json.loads(raw)
+    except Exception:
         return None
 
 
-def _iter_rsc_rows(
-    html: str,
-) -> Iterable[Any]:
-    """
-    Parse JSON-valued Flight rows after all inline chunks have been joined.
-
-    Example:
-
-        24:["$","$L21","id",{"feed":{...}}]
-
-    becomes:
-
-        ["$","$L21","id",{"feed":{...}}]
-    """
-
-    combined = _combined_rsc_payload(
-        html
-    )
-
-    if not combined:
-        return
-
-    for raw_line in combined.splitlines():
-        line = raw_line.strip()
-
-        if (
-            not line
-            or ":" not in line
-        ):
-            continue
-
-        _row_id, row_value = (
-            line.split(
-                ":",
-                1,
-            )
-        )
-
-        parsed = _parse_rsc_row_value(
-            row_value
-        )
-
-        if parsed is None:
-            continue
-
-        yield parsed
+# -----------------------------------------------------------------------------
+# Feed-object extraction
+# -----------------------------------------------------------------------------
 
 
-def _walk_json(
-    value: Any,
-) -> Iterable[Any]:
-    """
-    Recursively walk dictionaries and lists.
-    """
-
-    if isinstance(
-        value,
-        dict,
-    ):
-        yield value
-
-        for child in value.values():
-            yield from _walk_json(
-                child
-            )
-
-        return
-
-    if isinstance(
-        value,
-        list,
-    ):
-        for child in value:
-            yield from _walk_json(
-                child
-            )
-
-
-# ---------------------------------------------------------------------------
-# Feed object extraction
-# ---------------------------------------------------------------------------
-
-def _looks_like_feed_object(
-    value: Any,
-) -> bool:
-    if not isinstance(
-        value,
-        dict,
-    ):
+def _looks_like_feed_object(value: Any) -> bool:
+    """Check whether a dictionary looks like a Desihub feed object."""
+    if not isinstance(value, dict):
         return False
 
-    slug = _normalize_slug(
-        value.get("slug")
-    )
+    slug = value.get("slug")
+    title = value.get("title")
+    media_items = value.get("mediaItems")
 
-    title = _clean_string(
-        value.get("title")
-    )
-
-    media_items = value.get(
-        "mediaItems"
-    )
-
-    if not slug:
+    if not isinstance(slug, str) or not slug.strip():
         return False
 
-    if not title:
+    if not isinstance(title, str) or not title.strip():
         return False
 
-    if not isinstance(
-        media_items,
-        list,
-    ):
+    if not isinstance(media_items, list):
         return False
 
     return True
 
 
-def _feed_object_key(
-    feed_object: Dict[str, Any],
-) -> Tuple[Any, str]:
-    return (
-        feed_object.get(
-            "_id"
-        ),
-        _normalize_slug(
-            feed_object.get(
-                "slug"
-            )
-        )
-        or "",
-    )
+def _feed_object_identity(value: Dict[str, Any]) -> str:
+    """Build a stable-ish deduplication key."""
+    object_id = _clean_string(value.get("_id"))
+    slug = normalize_slug(value.get("slug")) or ""
+    return object_id or slug
 
 
-def extract_rsc_feed_objects(
-    html: str,
-) -> List[Dict[str, Any]]:
+def _extract_feed_objects_direct(stream: str) -> List[Dict[str, Any]]:
     """
-    Extract every actual feed object from the RSC Flight payload.
+    Extract feed objects directly from every decoded `"feed": {...}` occurrence.
 
-    The parser deliberately does NOT depend on a volatile component ID such
-    as $L20 or $L21.
-
-    Instead it identifies the stable feed-object shape:
-
-        title
-        slug
-        mediaItems
+    This is the primary extractor.  It intentionally does not depend on Flight
+    row boundaries or `$Lxx` reference resolution.  That matters because a
+    large object can be split across multiple self.__next_f.push chunks.
     """
+    if not stream:
+        return []
 
-    results: List[
-        Dict[str, Any]
-    ] = []
+    results: List[Dict[str, Any]] = []
+    seen = set()
+    search_from = 0
 
-    seen: Set[
-        Tuple[Any, str]
-    ] = set()
+    while True:
+        match = FEED_KEY_PATTERN.search(stream, search_from)
+        if match is None:
+            break
 
-    for row in _iter_rsc_rows(
-        html
-    ):
-        for candidate in _walk_json(
-            row
-        ):
-            if not _looks_like_feed_object(
-                candidate
-            ):
-                continue
+        object_start = match.end()
+        while object_start < len(stream) and stream[object_start].isspace():
+            object_start += 1
 
-            key = _feed_object_key(
-                candidate
-            )
+        if object_start >= len(stream) or stream[object_start] != "{":
+            search_from = match.end()
+            continue
 
-            if key in seen:
-                continue
+        raw = _extract_balanced_json(stream, object_start)
+        if raw is None:
+            # Do not get stuck if malformed text contains another `feed` key.
+            search_from = match.end()
+            continue
 
-            seen.add(
-                key
-            )
+        try:
+            value = json.loads(raw)
+        except Exception:
+            search_from = object_start + 1
+            continue
 
-            results.append(
-                candidate
-            )
+        if _looks_like_feed_object(value):
+            identity = _feed_object_identity(value)
+            if identity not in seen:
+                seen.add(identity)
+                results.append(value)
+
+        search_from = object_start + len(raw)
 
     return results
 
 
-# ---------------------------------------------------------------------------
-# Media normalization
-# ---------------------------------------------------------------------------
+def _walk_json(value: Any) -> Iterator[Any]:
+    """Yield every nested list/dict value recursively."""
+    yield value
 
-def normalize_media_item(
-    media_item: Any,
-    position: int,
-) -> Optional[
-    Dict[str, Any]
-]:
-    if not isinstance(
-        media_item,
-        dict,
-    ):
+    if isinstance(value, dict):
+        for child in value.values():
+            yield from _walk_json(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _walk_json(child)
+
+
+def _extract_feed_objects_from_decoded_json(stream: str) -> List[Dict[str, Any]]:
+    """
+    Secondary fallback for streams where a feed object is already represented
+    as a complete JSON value inside a Flight row.
+    """
+    results: List[Dict[str, Any]] = []
+    seen = set()
+
+    # Flight rows are normally newline-delimited.  Parsing each complete row is
+    # useful as a fallback but is deliberately not the primary strategy.
+    for line in stream.splitlines():
+        line = line.strip()
+        if not line or ":" not in line:
+            continue
+
+        _, raw_value = line.split(":", 1)
+        raw_value = raw_value.strip()
+
+        if not raw_value or raw_value[0] not in "[{":
+            continue
+
+        parsed = _parse_json_at(raw_value, 0)
+        if parsed is None:
+            continue
+
+        for value in _walk_json(parsed):
+            if not _looks_like_feed_object(value):
+                continue
+
+            identity = _feed_object_identity(value)
+            if identity in seen:
+                continue
+
+            seen.add(identity)
+            results.append(value)
+
+    return results
+
+
+def extract_rsc_feed_objects(html: str) -> List[Dict[str, Any]]:
+    """
+    Extract all Desihub feed objects from an HTML page.
+
+    Primary path:
+        HTML -> __next_f segments -> decoded Flight stream -> `feed` objects.
+
+    Fallback path:
+        Complete Flight rows -> recursively locate feed-shaped dictionaries.
+    """
+    stream = combined_rsc_payload(html)
+
+    direct = _extract_feed_objects_direct(stream)
+    if direct:
+        return direct
+
+    return _extract_feed_objects_from_decoded_json(stream)
+
+
+def _extract_feed_object_near_slug(stream: str, requested_slug: str) -> Optional[Dict[str, Any]]:
+    """
+    Recover one feed object when the normal `\"feed\": {...}` scan misses it.
+
+    This is specifically for individual Next.js pages where the requested slug
+    can appear inside a streamed Flight value that is not exposed as a clean
+    standalone row. We locate the exact slug in the reconstructed stream, walk
+    backwards to the nearest feed property, then use balanced JSON extraction.
+    """
+    wanted = normalize_slug(requested_slug)
+    wanted_key = slug_key(wanted)
+    if not wanted or not wanted_key or not stream:
         return None
 
-    media_type = _clean_string(
-        media_item.get(
-            "type"
-        )
-    )
+    escaped_slug = json.dumps(wanted)[1:-1]
+    slug_patterns = [
+        f'\"slug\":\"{escaped_slug}\"',
+        f'"slug": "{escaped_slug}"',
+    ]
 
-    if media_type:
-        media_type = (
-            media_type.lower()
-        )
+    slug_positions: List[int] = []
+    for pattern in slug_patterns:
+        start = 0
+        while True:
+            pos = stream.find(pattern, start)
+            if pos < 0:
+                break
+            slug_positions.append(pos)
+            start = pos + len(pattern)
 
-    media_id = _clean_string(
-        media_item.get(
-            "id"
-        )
-    )
+    if not slug_positions:
+        # Defensive fallback for escaped JSON fragments.
+        raw_pos = stream.find(wanted)
+        if raw_pos >= 0:
+            slug_positions.append(raw_pos)
 
-    # ------------------------------------------------------------------
-    # Video
-    # ------------------------------------------------------------------
+    for slug_pos in sorted(set(slug_positions)):
+        feed_matches = list(FEED_KEY_PATTERN.finditer(stream, 0, slug_pos))
+        if not feed_matches:
+            continue
 
-    if (
-        media_type == "video"
-        or any(
-            media_item.get(
-                key
-            )
-            for key in (
-                "videoId",
-                "videoUrl",
-                "thumbnailUrl",
-                "duration",
-            )
-        )
-    ):
-        embed_url = _clean_string(
-            media_item.get(
-                "url"
-            )
-            or media_item.get(
-                "embedUrl"
-            )
-            or media_item.get(
-                "embed_url"
-            )
-        )
+        feed_match = feed_matches[-1]
+        object_start = feed_match.end()
+        while object_start < len(stream) and stream[object_start].isspace():
+            object_start += 1
 
-        video_id = _clean_string(
-            media_item.get(
-                "videoId"
-            )
-            or media_item.get(
-                "video_id"
-            )
-        )
+        if object_start >= len(stream) or stream[object_start] != "{":
+            continue
 
-        video_url = _clean_string(
-            media_item.get(
-                "videoUrl"
-            )
-            or media_item.get(
-                "video_url"
-            )
-        )
+        raw = _extract_balanced_json(stream, object_start)
+        if raw is None:
+            continue
 
-        thumbnail = _clean_string(
-            media_item.get(
-                "thumbnailUrl"
-            )
-            or media_item.get(
-                "thumbnail"
-            )
-        )
+        try:
+            value = json.loads(raw)
+        except Exception:
+            continue
 
-        duration = _safe_int(
-            media_item.get(
-                "duration"
-            )
-        )
+        if _looks_like_feed_object(value) and slug_key(value.get("slug")) == wanted_key:
+            return value
+
+    return None
+
+
+
+def _extract_post_object_from_stream_by_slug(stream: str, requested_slug: str) -> Optional[Dict[str, Any]]:
+    """
+    Last RSC fallback for an individual post page.
+
+    If the page serializes the requested slug and its `mediaItems` but the
+    surrounding Flight object cannot be recovered as a normal `feed` object,
+    reconstruct the minimum feed-shaped dictionary directly from those fields.
+    This still requires an exact slug match and never selects another post.
+    """
+    wanted = normalize_slug(requested_slug)
+    wanted_key = slug_key(wanted)
+    if not wanted or not wanted_key or not stream:
+        return None
+
+    slug_pattern = re.compile(r'"slug"\s*:\s*"(?P<slug>(?:\\.|[^"\\])*)"')
+
+    for match in slug_pattern.finditer(stream):
+        candidate = _decode_json_fragment(match.group("slug"))
+        if not candidate or slug_key(candidate) != wanted_key:
+            continue
+
+        start_after_slug = match.end()
+        media_match = re.search(r'"mediaItems"\s*:\s*\[', stream[start_after_slug:])
+        if media_match is None:
+            continue
+
+        media_start = start_after_slug + media_match.end() - 1
+        raw_media = _extract_balanced_json(stream, media_start)
+        if raw_media is None:
+            continue
+
+        try:
+            media_items = json.loads(raw_media)
+        except Exception:
+            continue
+
+        if not isinstance(media_items, list):
+            continue
+
+        title = None
+        title_matches = list(re.finditer(r'"title"\s*:\s*"(?P<title>(?:\\.|[^"\\])*)"', stream, 0, match.start()))
+        if title_matches:
+            title = _decode_json_fragment(title_matches[-1].group("title"))
+
+        object_id = None
+        id_matches = list(re.finditer(r'"_id"\s*:\s*"(?P<id>(?:\\.|[^"\\])*)"', stream, 0, match.start()))
+        if id_matches:
+            object_id = _decode_json_fragment(id_matches[-1].group("id"))
 
         return {
-            "position": position,
-            "type": "video",
-            "id": media_id,
-            "embed_url": embed_url,
-            "video_id": video_id,
-            "video_url": video_url,
-            "thumbnail": thumbnail,
-            "duration": duration,
+            "_id": object_id,
+            "title": title or wanted,
+            "slug": candidate,
+            "mediaItems": media_items,
         }
 
-    # ------------------------------------------------------------------
-    # Image
-    # ------------------------------------------------------------------
+    return None
 
-    if (
-        media_type == "image"
-        or media_item.get(
-            "url"
-        )
-    ):
-        image_url = _clean_string(
-            media_item.get(
-                "url"
-            )
-            or media_item.get(
-                "imageUrl"
-            )
-            or media_item.get(
-                "image_url"
-            )
-        )
+def find_feed_object_by_slug(
+    feed_objects: Sequence[Dict[str, Any]],
+    requested_slug: str,
+) -> Optional[Dict[str, Any]]:
+    """Find a feed object using exact normalized slug matching first."""
+    wanted = normalize_slug(requested_slug)
+    wanted_key = slug_key(wanted)
 
-        if image_url:
-            return {
-                "position": position,
-                "type": "image",
-                "id": media_id,
-                "url": image_url,
-            }
+    if not wanted:
+        return None
+
+    for feed in feed_objects:
+        candidate = normalize_slug(feed.get("slug"))
+        if candidate == wanted:
+            return feed
+
+    # A defensive comparison for URL-decoded/HTML-normalized slug differences.
+    for feed in feed_objects:
+        candidate_key = slug_key(feed.get("slug"))
+        if candidate_key and candidate_key == wanted_key:
+            return feed
 
     return None
 
 
-def normalize_media_items(
-    media_items: Any,
-) -> List[
-    Dict[str, Any]
-]:
-    if not isinstance(
-        media_items,
-        list,
-    ):
-        return []
-
-    normalized: List[
-        Dict[str, Any]
-    ] = []
-
-    for position, media_item in enumerate(
-        media_items
-    ):
-        item = normalize_media_item(
-            media_item,
-            position,
-        )
-
-        if item is None:
-            continue
-
-        normalized.append(
-            item
-        )
-
-    return normalized
+# -----------------------------------------------------------------------------
+# Media normalization
+# -----------------------------------------------------------------------------
 
 
-def get_feed_media_items(
-    feed_object: Dict[str, Any],
-) -> List[
-    Dict[str, Any]
-]:
-    return normalize_media_items(
-        feed_object.get(
-            "mediaItems"
+def _normalize_video_media(item: Dict[str, Any], base_url: str) -> Dict[str, Any]:
+    """Normalize one raw video media item."""
+    embed_url = absolute_url(
+        _first_non_empty(item.get("url"), item.get("embedUrl"), item.get("embed_url")),
+        base_url,
+    )
+
+    video_url = absolute_url(
+        _first_non_empty(item.get("videoUrl"), item.get("video_url"), item.get("src")),
+        base_url,
+    )
+
+    thumbnail = absolute_url(
+        _first_non_empty(
+            item.get("thumbnailUrl"),
+            item.get("thumbnail"),
+            item.get("poster"),
+        ),
+        base_url,
+    )
+
+    video_id = _clean_string(
+        _first_non_empty(
+            item.get("videoId"),
+            item.get("video_id"),
+            item.get("id"),
         )
     )
 
+    duration = _safe_int(item.get("duration"))
 
-def get_video_media(
-    feed_object: Dict[str, Any],
-) -> List[
-    Dict[str, Any]
-]:
-    return [
-        media
-        for media in get_feed_media_items(
-            feed_object
-        )
-        if media.get(
-            "type"
-        ) == "video"
-    ]
+    result: Dict[str, Any] = {
+        "type": "video",
+        "id": _clean_string(item.get("id")),
+        "video_id": video_id,
+        "embed_url": embed_url,
+        "video_url": video_url,
+        "thumbnail": thumbnail,
+        "duration": duration,
+    }
 
-
-def get_image_media(
-    feed_object: Dict[str, Any],
-) -> List[
-    Dict[str, Any]
-]:
-    return [
-        media
-        for media in get_feed_media_items(
-            feed_object
-        )
-        if media.get(
-            "type"
-        ) == "image"
-    ]
+    # Remove nulls only for optional compatibility fields.  `type` remains.
+    return {key: value for key, value in result.items() if value is not None}
 
 
-def classify_media(
-    media: List[
-        Dict[str, Any]
-    ],
-) -> str:
-    if not media:
+def _normalize_image_media(item: Dict[str, Any], base_url: str) -> Dict[str, Any]:
+    """Normalize one raw image media item."""
+    image_url = absolute_url(
+        _first_non_empty(
+            item.get("url"),
+            item.get("imageUrl"),
+            item.get("image_url"),
+            item.get("src"),
+        ),
+        base_url,
+    )
+
+    result: Dict[str, Any] = {
+        "type": "image",
+        "id": _clean_string(item.get("id")),
+        "image_url": image_url,
+    }
+
+    return {key: value for key, value in result.items() if value is not None}
+
+
+def normalize_media_item(item: Any, base_url: str) -> Optional[Dict[str, Any]]:
+    """Normalize one media item while preserving source order."""
+    if not isinstance(item, dict):
+        return None
+
+    raw_type = _clean_string(item.get("type"))
+    raw_type = raw_type.lower() if raw_type else ""
+
+    if raw_type == "video":
+        return _normalize_video_media(item, base_url)
+
+    if raw_type == "image":
+        return _normalize_image_media(item, base_url)
+
+    # Defensive inference for future upstream shape changes.
+    if _first_non_empty(
+        item.get("videoUrl"),
+        item.get("video_url"),
+        item.get("videoId"),
+        item.get("embedUrl"),
+    ):
+        return _normalize_video_media(item, base_url)
+
+    if _first_non_empty(
+        item.get("imageUrl"),
+        item.get("image_url"),
+        item.get("src"),
+    ):
+        return _normalize_image_media(item, base_url)
+
+    if _first_non_empty(item.get("url")):
+        url = _clean_string(item.get("url")) or ""
+        lowered = url.lower()
+        if any(ext in lowered for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif")):
+            return _normalize_image_media(item, base_url)
+
+        return _normalize_video_media(item, base_url)
+
+    return None
+
+
+def get_feed_media_items(feed_object: Dict[str, Any], base_url: str) -> List[Dict[str, Any]]:
+    """Normalize feed_object.mediaItems preserving original order."""
+    raw_items = feed_object.get("mediaItems")
+    if not isinstance(raw_items, list):
+        return []
+
+    result: List[Dict[str, Any]] = []
+
+    for raw_item in raw_items:
+        normalized = normalize_media_item(raw_item, base_url)
+        if normalized is not None:
+            result.append(normalized)
+
+    return result
+
+
+def get_video_media(media: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Return video media in original order."""
+    return [item for item in media if item.get("type") == "video"]
+
+
+def get_image_media(media: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Return image media in original order."""
+    return [item for item in media if item.get("type") == "image"]
+
+
+def classify_media(media: Sequence[Dict[str, Any]]) -> str:
+    """Classify a post using the Phase 2 response contract."""
+    video_count = len(get_video_media(media))
+    image_count = len(get_image_media(media))
+
+    if video_count == 0 and image_count == 0:
         return "unknown"
 
-    video_count = sum(
-        1
-        for item in media
-        if item.get(
-            "type"
-        ) == "video"
-    )
-
-    image_count = sum(
-        1
-        for item in media
-        if item.get(
-            "type"
-        ) == "image"
-    )
-
-    if (
-        video_count
-        and image_count
-    ):
-        return "mixed"
-
-    if image_count:
-        return "image_gallery"
-
-    if video_count > 1:
-        return "video_collection"
-
-    if video_count == 1:
+    if video_count == 1 and image_count == 0:
         return "video"
 
-    return "unknown"
+    if video_count > 1 and image_count == 0:
+        return "video_collection"
+
+    if video_count == 0 and image_count > 0:
+        return "image_gallery"
+
+    return "mixed"
 
 
-# ---------------------------------------------------------------------------
-# Slug / URL helpers
-# ---------------------------------------------------------------------------
-
-def extract_slug_from_url(
-    url: Any,
-) -> Optional[str]:
-    url = _clean_string(
-        url
-    )
-
-    if not url:
-        return None
-
-    parsed = urlparse(
-        url
-    )
-
-    path = (
-        parsed.path
-        if parsed.scheme
-        else url
-    )
-
-    path = unquote(
-        path
-    )
-
-    path = path.rstrip(
-        "/"
-    )
-
-    if not path:
-        return None
-
-    parts = [
-        part
-        for part in path.split(
-            "/"
-        )
-        if part
-    ]
-
-    if not parts:
-        return None
-
-    # /feed/page/6 is pagination, not a post.
-    if len(parts) >= 3:
-        for index in range(
-            len(parts) - 1
-        ):
-            if (
-                parts[index].lower()
-                == "page"
-                and parts[index + 1].isdigit()
-            ):
-                return None
-
-    lower_parts = [
-        part.lower()
-        for part in parts
-    ]
-
-    if "feed" in lower_parts:
-        feed_index = (
-            lower_parts.index(
-                "feed"
-            )
-        )
-
-        if (
-            feed_index + 1
-            < len(parts)
-        ):
-            return parts[
-                feed_index + 1
-            ]
-
-        return None
-
-    return parts[-1]
+def extract_rsc_media(feed_object: Dict[str, Any], base_url: str) -> List[Dict[str, Any]]:
+    """Compatibility wrapper for older code."""
+    return get_feed_media_items(feed_object, base_url)
 
 
-def canonical_post_url(
-    slug: str,
-    base_url: str,
-) -> str:
-    return (
-        f"{base_url.rstrip('/')}/feed/"
-        f"{slug.lstrip('/')}"
-    )
-
-
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Public item builder
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
-def build_public_item(
-    feed_object: Dict[str, Any],
-    base_url: str,
-) -> Dict[str, Any]:
-    media = get_feed_media_items(
-        feed_object
-    )
 
-    video_media = [
-        item
-        for item in media
-        if item.get(
-            "type"
-        ) == "video"
-    ]
+def _feed_url(feed_object: Dict[str, Any], base_url: str) -> Optional[str]:
+    """Build the upstream public post URL."""
+    slug = normalize_slug(feed_object.get("slug"))
+    if not slug:
+        return None
 
-    image_media = [
-        item
-        for item in media
-        if item.get(
-            "type"
-        ) == "image"
-    ]
+    return f"{base_url.rstrip('/')}/feed/{slug}"
 
-    first_video = (
-        video_media[0]
-        if video_media
-        else None
-    )
 
-    slug = _normalize_slug(
-        feed_object.get(
-            "slug"
-        )
-    )
+def build_public_item(feed_object: Dict[str, Any], base_url: str) -> Dict[str, Any]:
+    """
+    Convert one raw Desihub feed object to the public API item.
 
-    item_url = (
-        canonical_post_url(
-            slug,
-            base_url,
-        )
-        if slug
-        else None
-    )
+    Legacy first-video fields are kept for compatibility while `media` contains
+    every media item in original order.
+    """
+    media = get_feed_media_items(feed_object, base_url)
+    videos = get_video_media(media)
+    images = get_image_media(media)
+    first_video = videos[0] if videos else None
 
-    return {
-        "title": _clean_string(
-            feed_object.get(
-                "title"
-            )
-        ),
+    slug = normalize_slug(feed_object.get("slug"))
+
+    item: Dict[str, Any] = {
+        "title": _clean_string(feed_object.get("title")),
         "slug": slug,
-        "url": item_url,
-        "type": classify_media(
-            media
-        ),
-        "media_count": len(
-            media
-        ),
-        "video_count": len(
-            video_media
-        ),
-        "image_count": len(
-            image_media
-        ),
+        "url": _feed_url(feed_object, base_url),
+        "type": classify_media(media),
+        "media_count": len(media),
+        "video_count": len(videos),
+        "image_count": len(images),
         "media": media,
-
-        # Legacy first-video compatibility fields.
-        "embed_url": (
-            first_video.get(
-                "embed_url"
-            )
-            if first_video
-            else None
-        ),
-        "video_id": (
-            first_video.get(
-                "video_id"
-            )
-            if first_video
-            else None
-        ),
-        "video_url": (
-            first_video.get(
-                "video_url"
-            )
-            if first_video
-            else None
-        ),
-        "thumbnail": (
-            first_video.get(
-                "thumbnail"
-            )
-            if first_video
-            else None
-        ),
-        "duration": (
-            first_video.get(
-                "duration"
-            )
-            if first_video
-            else None
-        ),
+        "embed_url": first_video.get("embed_url") if first_video else None,
+        "video_id": first_video.get("video_id") if first_video else None,
+        "video_url": first_video.get("video_url") if first_video else None,
+        "thumbnail": first_video.get("thumbnail") if first_video else None,
+        "duration": first_video.get("duration") if first_video else None,
     }
 
-
-# ---------------------------------------------------------------------------
-# DOM helpers
-# ---------------------------------------------------------------------------
-
-def _find_dom_post_anchor(
-    soup: BeautifulSoup,
-    requested_slug: str,
-):
-    requested_slug = _normalize_slug(
-        requested_slug
-    )
-
-    if not requested_slug:
-        return None
-
-    for anchor in soup.find_all(
-        "a",
-        href=True,
-    ):
-        href = anchor.get(
-            "href"
-        )
-
-        if not href:
-            continue
-
-        slug = extract_slug_from_url(
-            href
-        )
-
-        if slug == requested_slug:
-            return anchor
-
-    return None
-
-
-def _extract_dom_media_from_post(
-    anchor,
-) -> List[
-    Dict[str, Any]
-]:
-    """
-    Fallback only.
-
-    RSC remains the primary source.
-    """
-
-    if anchor is None:
-        return []
-
-    root = anchor
-
-    media: List[
-        Dict[str, Any]
-    ] = []
-
-    iframes = root.find_all(
-        "iframe",
-        src=True,
-    )
-
-    for position, iframe in enumerate(
-        iframes
-    ):
-        src = _clean_string(
-            iframe.get(
-                "src"
-            )
-        )
-
-        if not src:
-            continue
-
-        media.append(
-            {
-                "position": position,
-                "type": "video",
-                "id": None,
-                "embed_url": src,
-                "video_id": None,
-                "video_url": None,
-                "thumbnail": None,
-                "duration": None,
-            }
-        )
-
-    image_offset = len(
-        media
-    )
-
-    for index, image in enumerate(
-        root.find_all(
-            "img",
-            src=True,
-        )
-    ):
-        src = _clean_string(
-            image.get(
-                "src"
-            )
-        )
-
-        if not src:
-            continue
-
-        if src.startswith(
-            "/_next/image"
-        ):
-            try:
-                parsed = urlparse(
-                    src
-                )
-
-                query = (
-                    parsed.query
-                )
-
-                for part in query.split(
-                    "&"
-                ):
-                    if part.startswith(
-                        "url="
-                    ):
-                        src = unquote(
-                            part.split(
-                                "=",
-                                1,
-                            )[1]
-                        )
-                        break
-
-            except Exception:
-                pass
-
-        if not _is_http_url(
-            src
-        ):
-            continue
-
-        media.append(
-            {
-                "position": (
-                    image_offset
-                    + index
-                ),
-                "type": "image",
-                "id": None,
-                "url": src,
-            }
-        )
-
-    return media
-
-
-def _build_dom_fallback_post(
-    soup: BeautifulSoup,
-    requested_slug: str,
-    base_url: str,
-) -> Optional[
-    Dict[str, Any]
-]:
-    anchor = _find_dom_post_anchor(
-        soup,
-        requested_slug,
-    )
-
-    if anchor is None:
-        return None
-
-    title = None
-
-    heading = anchor.find(
-        [
-            "h1",
-            "h2",
-            "h3",
-        ]
-    )
-
-    if heading is not None:
-        title = _clean_string(
-            heading.get_text(
-                " ",
-                strip=True,
-            )
-        )
-
-    media = _extract_dom_media_from_post(
-        anchor
-    )
-
-    if (
-        not title
-        and not media
-    ):
-        return None
-
-    normalized_slug = _normalize_slug(
-        requested_slug
-    )
-
-    if not normalized_slug:
-        return None
-
-    video_media = [
-        item
-        for item in media
-        if item.get(
-            "type"
-        ) == "video"
-    ]
-
-    image_media = [
-        item
-        for item in media
-        if item.get(
-            "type"
-        ) == "image"
-    ]
-
-    first_video = (
-        video_media[0]
-        if video_media
-        else None
-    )
-
-    return {
-        "title": title,
-        "slug": normalized_slug,
-        "url": canonical_post_url(
-            normalized_slug,
-            base_url,
-        ),
-        "type": classify_media(
-            media
-        ),
-        "media_count": len(
-            media
-        ),
-        "video_count": len(
-            video_media
-        ),
-        "image_count": len(
-            image_media
-        ),
-        "media": media,
-        "embed_url": (
-            first_video.get(
-                "embed_url"
-            )
-            if first_video
-            else None
-        ),
-        "video_id": None,
-        "video_url": None,
-        "thumbnail": None,
-        "duration": None,
+    # Metadata fields are useful on individual post responses and are safe to
+    # expose on feed items too.  They are kept null-free for cleaner JSON.
+    optional_metadata = {
+        "id": _clean_string(feed_object.get("_id")),
+        "channel_id": _clean_string(feed_object.get("channelId")),
+        "channel_name": _clean_string(feed_object.get("channelName")),
+        "username": _clean_string(feed_object.get("username")),
+        "avatar": absolute_url(feed_object.get("avatar"), base_url),
+        "created_at": _clean_string(feed_object.get("createdAt")),
     }
 
+    item.update(optional_metadata)
 
-# ---------------------------------------------------------------------------
-# Pagination extraction
-# ---------------------------------------------------------------------------
+    return item
 
-def _contains_aria_label(
-    value: Any,
-    wanted: str,
-) -> bool:
-    wanted = wanted.lower()
 
-    for node in _walk_json(
-        value
-    ):
-        if not isinstance(
-            node,
-            dict,
-        ):
-            continue
+# -----------------------------------------------------------------------------
+# DOM extraction helpers
+# -----------------------------------------------------------------------------
 
-        aria_label = _clean_string(
-            node.get(
-                "aria-label"
-            )
-        )
 
-        if (
-            aria_label
-            and wanted
-            in aria_label.lower()
-        ):
-            return True
+def _soup(html: str) -> BeautifulSoup:
+    """Create a BeautifulSoup document."""
+    return BeautifulSoup(html or "", "html.parser")
+
+
+def _anchor_label(anchor: Any) -> str:
+    """Return useful text/ARIA label for an anchor."""
+    aria = _clean_string(anchor.get("aria-label"))
+    text = _clean_string(anchor.get_text(" ", strip=True))
+    title = _clean_string(anchor.get("title"))
+    return _first_non_empty(aria, text, title) or ""
+
+
+def _is_pagination_anchor(anchor: Any) -> bool:
+    """Return True for anchors that look like pagination controls."""
+    href = _clean_string(anchor.get("href")) or ""
+    label = _anchor_label(anchor).lower()
+
+    if extract_page_number_from_url(href) is not None:
+        return True
+
+    if any(word in label for word in ("next", "previous", "prev", "pagination")):
+        return True
 
     return False
 
 
-def _collect_rsc_pagination(
-    html: str,
-) -> Tuple[
-    Optional[str],
-    Optional[str],
-]:
+def _collect_dom_pagination(html: str, current_page: Optional[int] = None) -> Dict[str, Optional[str]]:
     """
-    Read previous/next pagination from RSC.
+    Read pagination from rendered HTML.
 
-    We find an href dictionary whose subtree contains the appropriate
-    aria-label.
+    This remains a fallback because the site also stores pagination in RSC.
     """
+    soup = _soup(html)
+    navs = soup.find_all("nav")
 
-    next_path = None
-    previous_path = None
+    candidates = []
+    for nav in navs:
+        aria = (_clean_string(nav.get("aria-label")) or "").lower()
+        if "pagination" in aria:
+            candidates.append(nav)
 
-    for row in _iter_rsc_rows(
-        html
-    ):
-        for node in _walk_json(
-            row
-        ):
-            if not isinstance(
-                node,
-                dict,
-            ):
+    if not candidates:
+        candidates = navs
+
+    previous: Optional[str] = None
+    next_url: Optional[str] = None
+
+    for nav in candidates:
+        for anchor in nav.find_all("a", href=True):
+            if not _is_pagination_anchor(anchor):
                 continue
 
-            href = _clean_string(
-                node.get(
-                    "href"
-                )
-            )
-
+            href = _clean_string(anchor.get("href"))
             if not href:
                 continue
 
-            if not href.startswith(
-                "/feed"
-            ):
+            label = _anchor_label(anchor).lower()
+            target_page = extract_page_number_from_url(href)
+
+            if any(word in label for word in ("previous", "prev")):
+                previous = href
                 continue
 
-            if _contains_aria_label(
-                node,
-                "Next Page",
-            ):
-                next_path = href
+            if "next" in label:
+                next_url = href
+                continue
 
-            if _contains_aria_label(
-                node,
-                "Previous Page",
-            ):
-                previous_path = href
+            # If labels are icons only, infer direction from page number.
+            if current_page is not None and target_page is not None:
+                if target_page < current_page:
+                    previous = href
+                elif target_page > current_page:
+                    next_url = href
 
-    return (
-        next_path,
-        previous_path,
+    return {"next": next_url, "previous": previous}
+
+
+# -----------------------------------------------------------------------------
+# RSC pagination extraction
+# -----------------------------------------------------------------------------
+
+
+def _collect_rsc_pagination_from_stream(
+    stream: str,
+    current_page: Optional[int] = None,
+) -> Dict[str, Optional[str]]:
+    """
+    Extract pagination hrefs from the reconstructed Flight stream.
+
+    The important part is that this receives the *combined* stream, so a
+    pagination row split across multiple 2 KB Flight chunks is reconstructed
+    before searching it.
+    """
+    if not stream:
+        return {"next": None, "previous": None}
+
+    next_url: Optional[str] = None
+    previous_url: Optional[str] = None
+
+    # Look around explicit aria-label + href pairs first.
+    pair_pattern = re.compile(
+        r'"href"\s*:\s*"(?P<href>[^"\\]*(?:\\.[^"\\]*)*)"[^\n\r]{0,700}?"aria-label"\s*:\s*"(?P<label>[^"\\]*(?:\\.[^"\\]*)*)"',
+        re.DOTALL,
     )
 
+    for match in pair_pattern.finditer(stream):
+        href = _decode_json_fragment(match.group("href"))
+        label = _decode_json_fragment(match.group("label"))
+        if not href or not label:
+            continue
 
-def _collect_dom_pagination(
-    soup: BeautifulSoup,
-    base_url: str,
-) -> Tuple[
-    Optional[str],
-    Optional[str],
-]:
-    next_url = None
-    previous_url = None
+        label_lower = label.lower()
+        if "previous" in label_lower or "prev" in label_lower:
+            previous_url = href
+        elif "next" in label_lower:
+            next_url = href
 
-    for anchor in soup.find_all(
-        "a",
-        href=True,
-    ):
-        href = _clean_string(
-            anchor.get(
-                "href"
-            )
-        )
+    # Finally, collect every feed/page/N path from RSC and infer direction from
+    # the requested/current page. This is the most tolerant fallback.
+    page_paths: List[Tuple[int, str]] = []
+    href_pattern = re.compile(r'"href"\s*:\s*"(?P<href>[^"\\]*(?:\\.[^"\\]*)*)"')
 
+    for match in href_pattern.finditer(stream):
+        href = _decode_json_fragment(match.group("href"))
         if not href:
             continue
 
-        text = anchor.get_text(
-            " ",
-            strip=True,
-        ).lower()
+        page_number = extract_page_number_from_url(href)
+        if page_number is None:
+            continue
 
-        aria_label = _clean_string(
-            anchor.get(
-                "aria-label"
-            )
-        )
+        page_paths.append((page_number, href))
 
-        aria_label = (
-            aria_label.lower()
-            if aria_label
-            else ""
-        )
+    if current_page is not None:
+        lower_candidates = [item for item in page_paths if item[0] < current_page]
+        higher_candidates = [item for item in page_paths if item[0] > current_page]
 
-        if (
-            "next page"
-            in aria_label
-            or text == "next"
-        ):
-            next_url = href
+        if previous_url is None and lower_candidates:
+            previous_url = max(lower_candidates, key=lambda item: item[0])[1]
 
-        if (
-            "previous page"
-            in aria_label
-            or "prev page"
-            in aria_label
-            or text == "previous"
-            or text == "prev"
-        ):
-            previous_url = href
+        if next_url is None and higher_candidates:
+            next_url = min(higher_candidates, key=lambda item: item[0])[1]
 
-    return (
-        next_url,
-        previous_url,
+    return {"next": next_url, "previous": previous_url}
+
+
+def _decode_json_fragment(value: str) -> Optional[str]:
+    """Decode an escaped JSON string fragment captured by regex."""
+    try:
+        decoded = json.loads(f'"{value}"')
+        return decoded if isinstance(decoded, str) else None
+    except Exception:
+        return value.replace('\\"', '"').replace("\\\\", "\\")
+
+
+def _collect_rsc_pagination(html: str, current_page: Optional[int] = None) -> Dict[str, Optional[str]]:
+    """Extract pagination from the reconstructed RSC stream."""
+    return _collect_rsc_pagination_from_stream(
+        combined_rsc_payload(html),
+        current_page=current_page,
     )
 
 
-def extract_pagination(
-    html: str,
-    base_url: str,
-) -> Dict[
-    str,
-    Optional[str],
-]:
+def extract_pagination(html: str, current_page: Optional[int] = None) -> Dict[str, Optional[str]]:
     """
-    Return upstream-relative pagination paths.
+    Extract upstream pagination.
 
-    app.py converts these into public API URLs.
+    RSC is preferred because it survives chunk splitting and icon-only controls.
+    DOM is used as a fallback when RSC has no usable result.
     """
-
-    (
-        rsc_next,
-        rsc_previous,
-    ) = _collect_rsc_pagination(
-        html
-    )
-
-    soup = BeautifulSoup(
-        html or "",
-        "html.parser",
-    )
-
-    (
-        dom_next,
-        dom_previous,
-    ) = _collect_dom_pagination(
-        soup,
-        base_url,
-    )
-
-    next_path = (
-        rsc_next
-        or dom_next
-    )
-
-    previous_path = (
-        rsc_previous
-        or dom_previous
-    )
+    rsc = _collect_rsc_pagination(html, current_page=current_page)
+    dom = _collect_dom_pagination(html, current_page=current_page)
 
     return {
-        "next": next_path,
-        "previous": previous_path,
+        "next": rsc.get("next") or dom.get("next"),
+        "previous": rsc.get("previous") or dom.get("previous"),
     }
 
 
-# ---------------------------------------------------------------------------
-# Feed page parser
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Legacy media/DOM helpers retained for compatibility
+# -----------------------------------------------------------------------------
 
-def _extract_page_title(
-    soup: BeautifulSoup,
-) -> Optional[str]:
-    title = soup.find(
-        "title"
-    )
 
-    if title is None:
+def extract_iframe_urls(html: str, base_url: str) -> List[str]:
+    """Extract iframe URLs from rendered HTML as a legacy fallback."""
+    soup = _soup(html)
+    urls: List[str] = []
+
+    for iframe in soup.find_all("iframe"):
+        src = absolute_url(iframe.get("src"), base_url)
+        if src:
+            urls.append(src)
+
+    return _dedupe_preserve_order(urls)
+
+
+def extract_media_urls_from_html(html: str, base_url: str) -> List[str]:
+    """Extract common media-like URLs from rendered HTML."""
+    soup = _soup(html)
+    urls: List[str] = []
+
+    for tag_name, attribute in (
+        ("video", "src"),
+        ("source", "src"),
+        ("img", "src"),
+        ("iframe", "src"),
+    ):
+        for tag in soup.find_all(tag_name):
+            value = absolute_url(tag.get(attribute), base_url)
+            if value:
+                urls.append(value)
+
+    return _dedupe_preserve_order(urls)
+
+
+def extract_title_from_dom(html: str) -> Optional[str]:
+    """Extract a best-effort title from HTML."""
+    soup = _soup(html)
+
+    h1 = soup.find("h1")
+    if h1:
+        value = _clean_string(h1.get_text(" ", strip=True))
+        if value:
+            return value
+
+    h2 = soup.find("h2")
+    if h2:
+        value = _clean_string(h2.get_text(" ", strip=True))
+        if value:
+            return value
+
+    if soup.title:
+        return _clean_string(soup.title.get_text(" ", strip=True))
+
+    return None
+
+
+def extract_slug_from_url(url: str) -> Optional[str]:
+    """Extract a post slug from a /feed/<slug> URL."""
+    value = _clean_string(url)
+    if not value:
         return None
 
-    return _clean_string(
-        title.get_text(
-            " ",
-            strip=True,
-        )
-    )
+    parsed = urlparse(value)
+    path = parsed.path.strip("/")
+
+    if not path.startswith("feed/"):
+        return None
+
+    remainder = path[len("feed/") :]
+    if remainder.startswith("page/"):
+        return None
+
+    return normalize_slug(remainder)
+
+
+def extract_slug_from_dom(html: str) -> Optional[str]:
+    """Extract the first post slug from a feed link in rendered HTML."""
+    soup = _soup(html)
+
+    for anchor in soup.find_all("a", href=True):
+        href = _clean_string(anchor.get("href"))
+        if not href:
+            continue
+
+        slug = extract_slug_from_url(href)
+        if slug:
+            return slug
+
+    return None
+
+
+def extract_dom_feed_items(html: str, base_url: str) -> List[Dict[str, Any]]:
+    """
+    Legacy DOM-only feed parser.
+
+    It is intentionally secondary to RSC extraction because rendered HTML can
+    hide media behind UI components or only show the first item in a gallery.
+    """
+    soup = _soup(html)
+    result: List[Dict[str, Any]] = []
+
+    for anchor in soup.find_all("a", href=True):
+        href = _clean_string(anchor.get("href"))
+        if not href:
+            continue
+
+        slug = extract_slug_from_url(href)
+        if not slug:
+            continue
+
+        heading = anchor.find(["h1", "h2", "h3", "h4"])
+        title = _clean_string(heading.get_text(" ", strip=True)) if heading else None
+
+        media: List[Dict[str, Any]] = []
+
+        for iframe in anchor.find_all("iframe"):
+            src = absolute_url(iframe.get("src"), base_url)
+            if src:
+                media.append(
+                    {
+                        "type": "video",
+                        "embed_url": src,
+                    }
+                )
+
+        for image in anchor.find_all("img"):
+            src = absolute_url(image.get("src"), base_url)
+            if src:
+                media.append(
+                    {
+                        "type": "image",
+                        "image_url": src,
+                    }
+                )
+
+        if not title and not media:
+            continue
+
+        item = {
+            "title": title,
+            "slug": slug,
+            "url": absolute_url(href, base_url),
+            "type": classify_media(media),
+            "media_count": len(media),
+            "video_count": len(get_video_media(media)),
+            "image_count": len(get_image_media(media)),
+            "media": media,
+            "embed_url": media[0].get("embed_url") if media and media[0].get("type") == "video" else None,
+            "video_id": None,
+            "video_url": None,
+            "thumbnail": None,
+            "duration": None,
+        }
+
+        result.append(item)
+
+    return result
+
+
+# -----------------------------------------------------------------------------
+# Feed page parser
+# -----------------------------------------------------------------------------
 
 
 def parse_page(
     html: str,
     base_url: str,
+    current_page: Optional[int] = None,
 ) -> Dict[str, Any]:
-    if not html:
-        return {
-            "title": None,
-            "count": 0,
-            "items": [],
-            "pagination": {
-                "next": None,
-                "previous": None,
-            },
-        }
+    """
+    Parse a feed page into the public Phase 2/3 response shape.
 
-    soup = BeautifulSoup(
-        html,
-        "html.parser",
-    )
+    No network calls happen here and nothing is persisted.
+    """
+    if current_page is None:
+        current_page = extract_page_number_from_url(base_url)
+        if current_page is None:
+            current_page = 1
 
-    title = _extract_page_title(
-        soup
-    )
+    feed_objects = extract_rsc_feed_objects(html)
 
-    feed_objects = (
-        extract_rsc_feed_objects(
-            html
-        )
-    )
-
-    feeds_by_slug: Dict[
-        str,
-        Dict[str, Any],
-    ] = {}
+    items: List[Dict[str, Any]] = []
+    seen_slugs = set()
 
     for feed_object in feed_objects:
-        slug = _normalize_slug(
-            feed_object.get(
-                "slug"
-            )
-        )
-
+        item = build_public_item(feed_object, base_url)
+        slug = normalize_slug(item.get("slug"))
         if not slug:
             continue
 
-        if slug not in feeds_by_slug:
-            feeds_by_slug[
-                slug
-            ] = feed_object
-
-    items: List[
-        Dict[str, Any]
-    ] = []
-
-    seen_slugs: Set[
-        str
-    ] = set()
-
-    # ------------------------------------------------------------------
-    # Primary ordering source:
-    # rendered feed anchors
-    # ------------------------------------------------------------------
-
-    for anchor in soup.find_all(
-        "a",
-        href=True,
-    ):
-        href = _clean_string(
-            anchor.get(
-                "href"
-            )
-        )
-
-        if not href:
+        key = slug_key(slug)
+        if key in seen_slugs:
             continue
 
-        if (
-            href == "/feed"
-            or href.startswith(
-                "/feed/page/"
-            )
-        ):
-            continue
+        seen_slugs.add(key)
+        items.append(item)
 
-        slug = extract_slug_from_url(
-            href
-        )
-
-        if not slug:
-            continue
-
-        feed_object = (
-            feeds_by_slug.get(
-                slug
-            )
-        )
-
-        if feed_object is None:
-            continue
-
-        if slug in seen_slugs:
-            continue
-
-        seen_slugs.add(
-            slug
-        )
-
-        item = build_public_item(
-            feed_object,
-            base_url,
-        )
-
-        item["url"] = (
-            _absolute_or_original(
-                href,
-                base_url,
-            )
-        )
-
-        items.append(
-            item
-        )
-
-    # ------------------------------------------------------------------
-    # RSC fallback
-    # ------------------------------------------------------------------
-
-    if (
-        not items
-        and feed_objects
-    ):
-        for feed_object in feed_objects:
-            slug = _normalize_slug(
-                feed_object.get(
-                    "slug"
-                )
-            )
-
+    # If RSC extraction somehow fails completely, retain a DOM fallback rather
+    # than returning a false empty feed.
+    if not items:
+        dom_items = extract_dom_feed_items(html, base_url)
+        for item in dom_items:
+            slug = normalize_slug(item.get("slug"))
             if not slug:
                 continue
-
-            if slug in seen_slugs:
+            key = slug_key(slug)
+            if key in seen_slugs:
                 continue
+            seen_slugs.add(key)
+            items.append(item)
 
-            seen_slugs.add(
-                slug
-            )
-
-            items.append(
-                build_public_item(
-                    feed_object,
-                    base_url,
-                )
-            )
-
-    pagination = extract_pagination(
-        html,
-        base_url,
-    )
+    pagination = extract_pagination(html, current_page=current_page)
 
     return {
-        "title": title,
-        "count": len(
-            items
-        ),
         "items": items,
+        "count": len(items),
         "pagination": pagination,
+        "page": current_page,
     }
 
 
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Individual post parser
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
-def _find_feed_object_by_slug(
-    feed_objects: List[
-        Dict[str, Any
-        ]
-    ],
-    requested_slug: str,
-) -> Optional[
-    Dict[str, Any]
-]:
-    normalized_requested = (
-        _normalize_slug(
-            requested_slug
-        )
-    )
 
-    if not normalized_requested:
+def _find_dom_post_match(html: str, requested_slug: str, base_url: str) -> Optional[Dict[str, Any]]:
+    """Build a minimal post object from a matching DOM anchor."""
+    wanted_key = slug_key(requested_slug)
+    if not wanted_key:
         return None
 
-    # Exact match first.
-    for feed_object in feed_objects:
-        slug = _normalize_slug(
-            feed_object.get(
-                "slug"
-            )
-        )
+    soup = _soup(html)
 
-        if (
-            slug
-            == normalized_requested
-        ):
-            return feed_object
+    for anchor in soup.find_all("a", href=True):
+        href = _clean_string(anchor.get("href"))
+        if not href:
+            continue
 
-    # Case-insensitive fallback.
-    requested_lower = (
-        normalized_requested.lower()
-    )
+        slug = extract_slug_from_url(href)
+        if not slug or slug_key(slug) != wanted_key:
+            continue
 
-    for feed_object in feed_objects:
-        slug = _normalize_slug(
-            feed_object.get(
-                "slug"
-            )
-        )
+        heading = anchor.find(["h1", "h2", "h3", "h4"])
+        title = _clean_string(heading.get_text(" ", strip=True)) if heading else extract_title_from_dom(html)
 
-        if (
-            slug
-            and slug.lower()
-            == requested_lower
-        ):
-            return feed_object
+        media: List[Dict[str, Any]] = []
+
+        for iframe in anchor.find_all("iframe"):
+            src = absolute_url(iframe.get("src"), base_url)
+            if src:
+                media.append({"type": "video", "embed_url": src})
+
+        for image in anchor.find_all("img"):
+            src = absolute_url(image.get("src"), base_url)
+            if src:
+                media.append({"type": "image", "image_url": src})
+
+        videos = get_video_media(media)
+        first_video = videos[0] if videos else None
+
+        return {
+            "title": title,
+            "slug": slug,
+            "url": absolute_url(href, base_url),
+            "type": classify_media(media),
+            "media_count": len(media),
+            "video_count": len(videos),
+            "image_count": len(get_image_media(media)),
+            "media": media,
+            "embed_url": first_video.get("embed_url") if first_video else None,
+            "video_id": None,
+            "video_url": None,
+            "thumbnail": None,
+            "duration": None,
+        }
 
     return None
 
@@ -1704,69 +1407,97 @@ def parse_post_page(
     html: str,
     requested_slug: str,
     base_url: str,
-) -> Optional[
-    Dict[str, Any]
-]:
+) -> Optional[Dict[str, Any]]:
     """
-    Parse one individual /feed/{slug} page.
+    Parse an individual `/feed/<slug>` page.
 
-    Phase 3 strategy:
+    Primary strategy:
+        1. reconstruct complete RSC stream
+        2. extract every `feed` object directly
+        3. exact-match requested slug
+        4. normalize into public item
 
-        1. Extract every RSC feed object.
-        2. Match the requested slug.
-        3. Build the exact same public media structure as feed pages.
-        4. Ignore recommendation objects.
-        5. Fall back to DOM only if RSC extraction fails.
+    DOM is only a final fallback.  We never substitute a different feed post
+    just because it happens to be present on the page.
     """
-
-    if not html:
+    wanted = normalize_slug(requested_slug)
+    if not wanted:
         return None
 
-    normalized_requested = (
-        _normalize_slug(
-            requested_slug
-        )
-    )
+    stream = combined_rsc_payload(html)
+    feed_objects = extract_rsc_feed_objects(html)
+    match = find_feed_object_by_slug(feed_objects, wanted)
 
-    if not normalized_requested:
-        return None
+    if match is not None:
+        return build_public_item(match, base_url)
 
-    feed_objects = (
-        extract_rsc_feed_objects(
-            html
-        )
-    )
+    # Individual post pages can expose the exact feed object in a streamed RSC
+    # value whose row boundaries differ from the feed-list page. Recover it by
+    # anchoring on the requested slug inside the already reconstructed stream.
+    near_slug_match = _extract_feed_object_near_slug(stream, wanted)
+    if near_slug_match is not None:
+        return build_public_item(near_slug_match, base_url)
 
-    primary_feed = (
-        _find_feed_object_by_slug(
-            feed_objects,
-            normalized_requested,
-        )
-    )
+    partial_match = _extract_post_object_from_stream_by_slug(stream, wanted)
+    if partial_match is not None:
+        return build_public_item(partial_match, base_url)
 
-    if primary_feed is not None:
-        item = build_public_item(
-            primary_feed,
-            base_url,
-        )
+    # Some page layouts may expose the primary post in rendered HTML even if the
+    # RSC data was blocked or changed. Only accept an exact slug match.
+    return _find_dom_post_match(html, wanted, base_url)
 
-        item["url"] = (
-            canonical_post_url(
-                normalized_requested,
-                base_url,
-            )
-        )
 
-        return item
+# -----------------------------------------------------------------------------
+# Debug/introspection helpers
+# -----------------------------------------------------------------------------
 
-    # DOM fallback.
-    soup = BeautifulSoup(
-        html,
-        "html.parser",
-    )
 
-    return _build_dom_fallback_post(
-        soup,
-        normalized_requested,
-        base_url,
-    )
+def parser_debug_info(html: str) -> Dict[str, Any]:
+    """Return non-sensitive parser diagnostics for local testing."""
+    segments = extract_next_f_segments(html)
+    stream = _flight_stream_from_segments(segments)
+    feeds = _extract_feed_objects_direct(stream)
+
+    return {
+        "html_length": len(html or ""),
+        "next_f_segment_count": len(segments),
+        "next_f_type1_count": sum(1 for tag, _ in segments if tag == 1),
+        "rsc_stream_length": len(stream),
+        "feed_object_count": len(feeds),
+        "feed_slugs": [normalize_slug(item.get("slug")) for item in feeds],
+    }
+
+
+__all__ = [
+    "absolute_url",
+    "build_public_item",
+    "classify_media",
+    "combined_rsc_payload",
+    "extract_dom_feed_items",
+    "extract_feed_objects",
+    "extract_iframe_urls",
+    "extract_media_urls_from_html",
+    "extract_next_f_payloads",
+    "extract_next_f_segments",
+    "extract_page_number_from_url",
+    "extract_pagination",
+    "extract_rsc_feed_objects",
+    "extract_rsc_media",
+    "extract_slug_from_dom",
+    "extract_slug_from_url",
+    "find_feed_object_by_slug",
+    "get_feed_media_items",
+    "get_image_media",
+    "get_video_media",
+    "normalize_media_item",
+    "normalize_slug",
+    "page_path_for_number",
+    "parse_page",
+    "parse_post_page",
+    "parser_debug_info",
+    "slug_key",
+]
+
+
+# Backwards-compatible alias used by a few earlier parser revisions.
+extract_feed_objects = extract_rsc_feed_objects
