@@ -1682,6 +1682,65 @@ def _find_dom_post_match(html: str, requested_slug: str, base_url: str) -> Optio
     return build_public_item(feed_object, base_url)
 
 
+def extract_post_recommendations(
+    html: str,
+    requested_slug: str,
+    base_url: str,
+) -> List[Dict[str, Any]]:
+    """
+    Extract the recommendation cards rendered in the direct post page's
+    ``You might like:`` section.
+
+    On Desihub's direct post pages the main post is rendered directly in the
+    page component, while recommendation cards are serialized as normal RSC
+    ``feed`` objects.  Therefore the existing RSC feed-object extractor is the
+    correct source for recommendations here.
+
+    The requested post is excluded defensively in case the upstream response
+    ever includes it in its own recommendation list.  Order is preserved.
+    """
+    wanted = normalize_slug(requested_slug)
+    if not html or not wanted:
+        return []
+
+    recommendations: List[Dict[str, Any]] = []
+    seen: set = set()
+
+    for feed_object in extract_rsc_feed_objects(html):
+        slug = normalize_slug(feed_object.get("slug"))
+        if not slug:
+            continue
+
+        if slug_key(slug) == slug_key(wanted):
+            continue
+
+        identity = _feed_object_identity(feed_object)
+        if identity in seen:
+            continue
+
+        seen.add(identity)
+        recommendations.append(build_public_item(feed_object, base_url))
+
+    return recommendations
+
+
+def _attach_post_recommendations(
+    item: Dict[str, Any],
+    html: str,
+    requested_slug: str,
+    base_url: str,
+) -> Dict[str, Any]:
+    """Attach normalized recommendation cards to an individual post item."""
+    recommendations = extract_post_recommendations(
+        html,
+        requested_slug,
+        base_url,
+    )
+    item["recommendation_count"] = len(recommendations)
+    item["recommendations"] = recommendations
+    return item
+
+
 def parse_post_page(
     html: str,
     requested_slug: str,
@@ -1706,7 +1765,7 @@ def parse_post_page(
     # PRIMARY: direct post DOM.
     dom_match = _find_dom_post_match(html, wanted, base_url)
     if dom_match is not None:
-        return dom_match
+        return _attach_post_recommendations(dom_match, html, wanted, base_url)
 
     # SECONDARY: some upstream revisions may serialize the main post as a
     # normal feed object.  Preserve the old robust RSC recovery for those pages.
@@ -1715,15 +1774,30 @@ def parse_post_page(
     match = find_feed_object_by_slug(feed_objects, wanted)
 
     if match is not None:
-        return build_public_item(match, base_url)
+        return _attach_post_recommendations(
+            build_public_item(match, base_url),
+            html,
+            wanted,
+            base_url,
+        )
 
     near_slug_match = _extract_feed_object_near_slug(stream, wanted)
     if near_slug_match is not None:
-        return build_public_item(near_slug_match, base_url)
+        return _attach_post_recommendations(
+            build_public_item(near_slug_match, base_url),
+            html,
+            wanted,
+            base_url,
+        )
 
     partial_match = _extract_post_object_from_stream_by_slug(stream, wanted)
     if partial_match is not None:
-        return build_public_item(partial_match, base_url)
+        return _attach_post_recommendations(
+            build_public_item(partial_match, base_url),
+            html,
+            wanted,
+            base_url,
+        )
 
     return None
 
@@ -1775,6 +1849,7 @@ __all__ = [
     "page_path_for_number",
     "parse_page",
     "parse_post_page",
+    "extract_post_recommendations",
     "parser_debug_info",
     "slug_key",
 ]
