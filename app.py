@@ -33,7 +33,6 @@ from fetcher import fetch_page
 from scraper.parser import (
     extract_generic_page_number_from_url,
     extract_page_number_from_url,
-    detect_post_route,
     normalize_slug,
     parse_listing_page,
     parse_page,
@@ -342,28 +341,21 @@ def _normalize_page_value(page: int) -> int:
 # -----------------------------------------------------------------------------
 
 
-def _candidate_post_urls(slug: str) -> List[str]:
-    """Return both Desihub individual-post families for route discovery."""
+def _post_url(slug: str, route: str) -> str:
+    """Build exactly one upstream post URL for the requested post family."""
     encoded = quote(slug, safe="-")
-    # Preserve the established Feed-post route first.  Newer /post pages are
-    # still supported as the fallback when /feed/<slug> does not exist.
-    return [
-        f"{BASE_URL}/feed/{encoded}",
-        f"{BASE_URL}/post/{encoded}",
-    ]
-
-
-def _route_candidates_for_item(item: Dict[str, Any], slug: str) -> List[Tuple[str, str]]:
-    """Choose the upstream post family from the item's actual href."""
-    route = detect_post_route(item.get("url")) or detect_post_route(item.get("source"))
-    encoded = quote(slug, safe="-")
-
-    if route == "post":
-        return [("post", f"{BASE_URL}/post/{encoded}")]
     if route == "feed":
-        return [("feed", f"{BASE_URL}/feed/{encoded}")]
+        return f"{BASE_URL}/feed/{encoded}"
+    return f"{BASE_URL}/post/{encoded}"
 
-    return [("post", f"{BASE_URL}/post/{encoded}"), ("feed", f"{BASE_URL}/feed/{encoded}")]
+
+def _candidate_post_urls(slug: str) -> List[str]:
+    """Legacy search enrichment candidates; public post routes do not use this."""
+    encoded = quote(slug, safe="-")
+    return [
+        f"{BASE_URL}/post/{encoded}",
+        f"{BASE_URL}/feed/{encoded}",
+    ]
 
 
 async def _resolve_search_item(
@@ -384,7 +376,7 @@ async def _resolve_search_item(
     async with semaphore:
         errors: List[str] = []
 
-        for route_hint, target_url in _route_candidates_for_item(item, slug):
+        for target_url in _candidate_post_urls(slug):
             try:
                 result = await fetch_page(target_url)
             except Exception as exc:
@@ -397,7 +389,7 @@ async def _resolve_search_item(
                 continue
 
             try:
-                parsed = parse_post_page(html, slug, BASE_URL, route_hint=route_hint)
+                parsed = parse_post_page(html, slug, BASE_URL)
             except Exception as exc:
                 errors.append(f"{target_url}: parser error: {exc}")
                 continue
@@ -658,138 +650,111 @@ async def channel_page_number(
     )
 
 
-async def _enrich_post_recommendations(
-    recommendations: Any,
-) -> List[Dict[str, Any]]:
-    """Resolve lightweight /post recommendations through their rich Feed route.
+@app.get("/api/feed/{slug:path}")
+async def feed_post_page(request: Request, slug: str) -> Dict[str, Any]:
+    """Scrape one individual upstream /feed/<slug> page only."""
+    requested_slug = normalize_requested_slug(slug)
+    upstream_url = _post_url(requested_slug, "feed")
 
-    Direct /post pages often serialize recommendation cards without channel/media
-    metadata. The older Feed post family still exposes the complete feed object,
-    so use /feed/<slug> first and /post/<slug> only as a fallback.
-    """
-    if not isinstance(recommendations, list) or not recommendations:
-        return recommendations if isinstance(recommendations, list) else []
+    try:
+        result = await fetch_page(upstream_url)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to fetch upstream feed post: {exc}",
+        ) from exc
 
-    semaphore = asyncio.Semaphore(4)
+    html = result.get("html") or ""
+    if not html:
+        raise HTTPException(
+            status_code=502,
+            detail="Upstream feed post returned an empty HTML response.",
+        )
 
-    async def resolve(item: Dict[str, Any]) -> Dict[str, Any]:
-        slug = normalize_requested_slug(item.get("slug"))
-        if not slug:
-            return item
+    try:
+        parsed = parse_post_page(
+            html,
+            requested_slug,
+            BASE_URL,
+            route_hint="feed",
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Feed post parser error: {exc}",
+        ) from exc
 
-        async with semaphore:
-            for route_hint in ("feed", "post"):
-                target = f"{BASE_URL}/{route_hint}/{quote(slug, safe='-')}"
-                try:
-                    result = await fetch_page(target)
-                    html = result.get("html") or ""
-                    if not html:
-                        continue
-                    parsed = parse_post_page(
-                        html, slug, BASE_URL, route_hint=route_hint
-                    )
-                    if not parsed:
-                        continue
-                    # A recommendation must stay a flat card. Do not nest its
-                    # own recommendation tree into the parent response.
-                    enriched = dict(item)
-                    enriched.update(parsed)
-                    enriched.pop("recommendations", None)
-                    enriched.pop("recommendation_count", None)
-                    enriched["slug"] = slug
-                    enriched["url"] = target
-                    return enriched
-                except Exception:
-                    continue
+    if parsed is None:
+        debug = parser_debug_info(html)
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": "Feed post not found.",
+                "requested_slug": requested_slug,
+                "upstream_url": result.get("url") or upstream_url,
+                "html_length": result.get("html_length", len(html)),
+                "rsc_feed_count": debug.get("feed_object_count", 0),
+            },
+        )
 
-        return item
-
-    tasks = [resolve(item) if isinstance(item, dict) else resolve({}) for item in recommendations]
-    return await asyncio.gather(*tasks)
+    return {
+        **parsed,
+        "source": upstream_url,
+        "post_source": upstream_url,
+        "requested_slug": requested_slug,
+    }
 
 
 @app.get("/api/post/{slug:path}")
 async def post_page(request: Request, slug: str) -> Dict[str, Any]:
-    """Scrape one individual upstream post page directly."""
+    """Scrape one individual upstream /post/<slug> page only."""
     requested_slug = normalize_requested_slug(slug)
+    upstream_url = _post_url(requested_slug, "post")
 
-    # Keep the established direct-post route first.  If the upstream exposes
-    # the same post through /post/<slug>, use it as a fallback.
-    candidates = _candidate_post_urls(requested_slug)
-
-    errors: List[str] = []
-
-    for target_url in candidates:
-        try:
-            result = await fetch_page(target_url)
-        except Exception as exc:
-            errors.append(f"{target_url}: {exc}")
-            continue
-
-        html = result.get("html") or ""
-        if not html:
-            errors.append(f"{target_url}: empty response")
-            continue
-
-        try:
-            route_hint = detect_post_route(target_url)
-            parsed = parse_post_page(html, requested_slug, BASE_URL, route_hint=route_hint)
-        except Exception as exc:
-            errors.append(f"{target_url}: parser error: {exc}")
-            continue
-
-        if parsed is not None:
-            if detect_post_route(target_url) == "post" and parsed.get("recommendations"):
-                parsed["recommendations"] = await _enrich_post_recommendations(
-                    parsed.get("recommendations")
-                )
-                parsed["recommendation_count"] = len(parsed["recommendations"])
-
-            return {
-                **parsed,
-                "source": target_url,
-                "post_source": target_url,
-                "requested_slug": requested_slug,
-            }
-
-        errors.append(f"{target_url}: post parser returned no match")
-
-    # Use the last/most useful fetch diagnostics when all candidates fail.
-    target_url = candidates[0]
     try:
-        result = await fetch_page(target_url)
-        html = result.get("html") or ""
-        debug = parser_debug_info(html) if html else {}
-        upstream_status = result.get("status")
-        upstream_url = result.get("url") or target_url
-        html_length = result.get("html_length", len(html))
-    except Exception:
-        debug = {}
-        upstream_status = None
-        upstream_url = target_url
-        html_length = 0
+        result = await fetch_page(upstream_url)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to fetch upstream post: {exc}",
+        ) from exc
 
-    raise HTTPException(
-        status_code=404,
-        detail={
-            "message": "Post not found.",
-            "requested_slug": requested_slug,
-            "upstream_status": upstream_status,
-            "upstream_url": upstream_url,
-            "html_length": html_length,
-            "rsc_feed_count": debug.get("feed_object_count", 0),
-            "attempts": candidates,
-            "errors": errors[-4:],
-        },
-    )
+    html = result.get("html") or ""
+    if not html:
+        raise HTTPException(
+            status_code=502,
+            detail="Upstream post returned an empty HTML response.",
+        )
 
+    try:
+        parsed = parse_post_page(
+            html,
+            requested_slug,
+            BASE_URL,
+            route_hint="post",
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Post parser error: {exc}",
+        ) from exc
 
-if __name__ == "__main__":
-    import uvicorn
+    if parsed is None:
+        debug = parser_debug_info(html)
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": "Post not found.",
+                "requested_slug": requested_slug,
+                "upstream_url": result.get("url") or upstream_url,
+                "html_length": result.get("html_length", len(html)),
+                "rsc_feed_count": debug.get("feed_object_count", 0),
+            },
+        )
 
-    uvicorn.run(
-        "app:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=False,
-    )
+    return {
+        **parsed,
+        "source": upstream_url,
+        "post_source": upstream_url,
+        "requested_slug": requested_slug,
+    }
