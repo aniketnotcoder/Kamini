@@ -410,11 +410,33 @@ async def _resolve_search_item(
             if not merged.get("thumbnail") and item.get("thumbnail"):
                 merged["thumbnail"] = item.get("thumbnail")
 
-            # A successful parse is enough even if the post legitimately has
-            # zero media.  `type: unknown` is only a failure signal when the
-            # direct parser could not identify the post at all.
-            merged.pop("post_resolve_error", None)
-            return merged
+            # Do not stop at the first 200 response.  Desihub currently has
+            # two post URL shapes in circulation:
+            #   /post/<slug>
+            #   /feed/<slug>
+            #
+            # A /post/<slug> response can be a valid HTML page but still be
+            # parsed as `unknown` when that route variant does not contain the
+            # direct-post media wrapper.  In that case we MUST continue to the
+            # /feed/<slug> fallback instead of returning the empty card.
+            #
+            # For search enrichment, a real media-bearing parse is the useful
+            # success condition.  If the parser identified the post but found
+            # no media, keep it only as a fallback candidate and continue trying
+            # the other route first.
+            parsed_media_count = parsed.get("media_count")
+            parsed_type = parsed.get("type")
+            if parsed_type != "unknown" or (
+                isinstance(parsed_media_count, int) and parsed_media_count > 0
+            ):
+                merged.pop("post_resolve_error", None)
+                return merged
+
+            errors.append(
+                f"{target_url}: parser matched post but returned no media "
+                f"(type={parsed_type!r}, media_count={parsed_media_count!r})"
+            )
+            continue
 
         # Do not delete the search result if an individual post fails.  Keep the
         # original card and expose a small diagnostic so the caller knows why
