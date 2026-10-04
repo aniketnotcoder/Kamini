@@ -2145,14 +2145,14 @@ def parse_post_page(
     base_url: str,
     route_hint: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Parse one individual Desihub post from the correct page family.
+    """Parse one individual Desihub post while preserving both post families.
 
-    Desihub has two different individual-post systems:
-      * /post/<slug> -> main-site post template
-      * /feed/<slug> -> Feed post template
+    /feed/<slug> is kept on the old RSC-first path because that is where the
+    complete feed object contains the video URL, thumbnail, channel metadata,
+    timestamps and rich recommendation objects.
 
-    The caller may provide route_hint when the source URL is already known.
-    Without it, the parser retains the historical auto-detection behavior.
+    /post/<slug> uses the direct-post DOM first because its main post is not a
+    normal feed RSC object.
     """
     wanted = normalize_slug(requested_slug)
     if not wanted:
@@ -2160,32 +2160,68 @@ def parse_post_page(
 
     route = route_hint if route_hint in {"post", "feed"} else None
 
-    # Both page families have a rendered H1/media DOM.  The parser's DOM
-    # selectors are template-aware, so use that first for the known family.
-    if route in (None, "post", "feed"):
-        dom_match = _find_dom_post_match(html, wanted, base_url, route_hint=route)
+    # ------------------------------------------------------------------
+    # FEED FAMILY: preserve the old working behaviour.
+    # RSC feed objects are authoritative here.  Do NOT return the DOM
+    # representation first, because it commonly contains only the iframe
+    # embed URL and loses video_url/thumbnail/channel/created_at metadata.
+    # ------------------------------------------------------------------
+    if route == "feed":
+        stream = combined_rsc_payload(html)
+        feed_objects = extract_rsc_feed_objects(html)
+        match = find_feed_object_by_slug(feed_objects, wanted)
+
+        if match is not None:
+            return _attach_post_recommendations(
+                build_public_item(match, base_url, route="feed"),
+                html,
+                wanted,
+                base_url,
+            )
+
+        near_slug_match = _extract_feed_object_near_slug(stream, wanted)
+        if near_slug_match is not None:
+            return _attach_post_recommendations(
+                build_public_item(near_slug_match, base_url, route="feed"),
+                html,
+                wanted,
+                base_url,
+            )
+
+        partial_match = _extract_post_object_from_stream_by_slug(stream, wanted)
+        if partial_match is not None:
+            return _attach_post_recommendations(
+                build_public_item(partial_match, base_url, route="feed"),
+                html,
+                wanted,
+                base_url,
+            )
+
+        # Only if the old RSC path cannot identify the post, fall back to DOM.
+        dom_match = _find_dom_post_match(html, wanted, base_url, route_hint="feed")
         if dom_match is not None:
-            if route:
-                resolved_route = route
-            else:
-                soup = _soup(html)
-                canonical = soup.find("link", rel=lambda value: value and "canonical" in value)
-                resolved_route = detect_post_route(canonical.get("href") if canonical else None) or "post"
-            dom_match["url"] = _post_url({"slug": wanted}, base_url, resolved_route)
+            dom_match["url"] = _post_url({"slug": wanted}, base_url, "feed")
             return _attach_post_recommendations(dom_match, html, wanted, base_url)
 
-        if route == "post":
-            return None
+        return None
 
-    # Feed RSC is the recovery path for Feed pages whose rendered DOM does not
-    # expose enough media information.
+    # ------------------------------------------------------------------
+    # /post FAMILY: direct rendered DOM first.  RSC feed objects on this
+    # template are recommendations, not the main post.
+    # ------------------------------------------------------------------
+    dom_match = _find_dom_post_match(html, wanted, base_url, route_hint="post")
+    if dom_match is not None:
+        dom_match["url"] = _post_url({"slug": wanted}, base_url, "post")
+        return _attach_post_recommendations(dom_match, html, wanted, base_url)
+
+    # Secondary recovery for unusual /post revisions.
     stream = combined_rsc_payload(html)
     feed_objects = extract_rsc_feed_objects(html)
     match = find_feed_object_by_slug(feed_objects, wanted)
 
     if match is not None:
         return _attach_post_recommendations(
-            build_public_item(match, base_url, route="feed"),
+            build_public_item(match, base_url, route="post"),
             html,
             wanted,
             base_url,
@@ -2194,7 +2230,7 @@ def parse_post_page(
     near_slug_match = _extract_feed_object_near_slug(stream, wanted)
     if near_slug_match is not None:
         return _attach_post_recommendations(
-            build_public_item(near_slug_match, base_url, route="feed"),
+            build_public_item(near_slug_match, base_url, route="post"),
             html,
             wanted,
             base_url,
@@ -2203,7 +2239,7 @@ def parse_post_page(
     partial_match = _extract_post_object_from_stream_by_slug(stream, wanted)
     if partial_match is not None:
         return _attach_post_recommendations(
-            build_public_item(partial_match, base_url, route="feed"),
+            build_public_item(partial_match, base_url, route="post"),
             html,
             wanted,
             base_url,
