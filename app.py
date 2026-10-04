@@ -41,7 +41,7 @@ from scraper.parser import (
 )
 
 
-APP_VERSION = "0.8.0"
+APP_VERSION = "0.8.1"
 BASE_URL = "https://desihub.sh"
 
 app = FastAPI(
@@ -256,8 +256,12 @@ def _discovery_page_number(
         return 1
     if route_kind == "channel" and "/channels/" in path:
         return 1
-    if route_kind == "search" and re.search(r"/x/[^/]+/?$", path):
-        return 1
+    if route_kind == "search":
+        if re.search(r"/x/[^/]+/?$", path):
+            return 1
+        match = re.search(r"/x/[^/]+/(\d+)/?$", path)
+        if match:
+            return int(match.group(1))
 
     return None
 
@@ -357,11 +361,12 @@ async def search(request: Request, q: str, page: int = 1) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail="Search query is required.")
 
     # Desihub search is path-based: /x/<query>.
-    # Pagination follows the same listing convention: /x/<query>/page/N.
+    # IMPORTANT: search pagination is /x/<query>/2, /x/<query>/3, ...
+    # (not /page/N). This is confirmed by the captured search page.
     encoded_query = quote(query, safe="-")
     upstream_url = f"{BASE_URL}/x/{encoded_query}"
     if page > 1:
-        upstream_url += f"/page/{page}"
+        upstream_url += f"/{page}"
 
     return await scrape_listing(
         request,
