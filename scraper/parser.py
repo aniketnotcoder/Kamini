@@ -2377,4 +2377,4 @@ __all__ = [
 
 
 # Backwards-compatible alias used by a few earlier parser revisions.
-extract_feed_objects = extract_rsc_feed_objectsects
+extract_feed_objects = extract_rsc_feed_objects
