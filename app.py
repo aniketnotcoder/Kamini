@@ -660,6 +660,70 @@ async def enrich_feed_post_media(item: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # -----------------------------------------------------------------------------
+# Individual /post recommendation enrichment
+# -----------------------------------------------------------------------------
+
+
+async def _enrich_post_recommendations(
+    recommendations: Any,
+) -> List[Dict[str, Any]]:
+    """Resolve /post recommendation cards through their own /post pages.
+
+    Direct-post recommendations belong to the /post content family. Resolving
+    them through /feed was the source of the missing media/channel metadata.
+    Keep this strictly /post-only and flatten each resolved post so the parent
+    response never contains nested recommendation trees.
+    """
+    if not isinstance(recommendations, list) or not recommendations:
+        return recommendations if isinstance(recommendations, list) else []
+
+    semaphore = asyncio.Semaphore(4)
+
+    async def resolve(item: Dict[str, Any]) -> Dict[str, Any]:
+        slug = normalize_requested_slug(item.get("slug"))
+        if not slug:
+            return item
+
+        target = f"{BASE_URL}/post/{quote(slug, safe='-')}"
+        async with semaphore:
+            try:
+                result = await fetch_page(target)
+                html = result.get("html") or ""
+                if not html:
+                    return item
+
+                parsed = parse_post_page(
+                    html,
+                    slug,
+                    BASE_URL,
+                    route_hint="post",
+                )
+                if not parsed:
+                    return item
+
+                enriched = dict(item)
+                enriched.update(parsed)
+                enriched.pop("recommendations", None)
+                enriched.pop("recommendation_count", None)
+                enriched["slug"] = slug
+                enriched["url"] = target
+
+                # Use the same /post page's own media metadata. This can fill
+                # duration through the embed/MP4 fallback without touching the
+                # recommendation list itself.
+                enriched = await enrich_feed_post_media(enriched)
+                return enriched
+            except Exception:
+                return item
+
+    tasks = [
+        resolve(item) if isinstance(item, dict) else resolve({})
+        for item in recommendations
+    ]
+    return await asyncio.gather(*tasks, return_exceptions=False)
+
+
+# -----------------------------------------------------------------------------
 # Routes
 # -----------------------------------------------------------------------------
 
@@ -957,6 +1021,17 @@ async def post_page(request: Request, slug: str) -> Dict[str, Any]:
                 "rsc_feed_count": debug.get("feed_object_count", 0),
             },
         )
+
+    # Enrich the main /post media from the same post/embed family.
+    parsed = await enrich_feed_post_media(parsed)
+
+    # IMPORTANT: /post recommendations are /post pages, not /feed pages.
+    # Resolve them through their own route so their media metadata is retained.
+    if parsed.get("recommendations"):
+        parsed["recommendations"] = await _enrich_post_recommendations(
+            parsed.get("recommendations")
+        )
+        parsed["recommendation_count"] = len(parsed["recommendations"])
 
     return {
         **parsed,
