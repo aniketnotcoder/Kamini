@@ -1067,7 +1067,7 @@ def extract_rsc_media(feed_object: Dict[str, Any], base_url: str) -> List[Dict[s
 
 
 def _feed_url(feed_object: Dict[str, Any], base_url: str) -> Optional[str]:
-    """Build the upstream public post URL."""
+    """Build the upstream Feed-post URL."""
     slug = normalize_slug(feed_object.get("slug"))
     if not slug:
         return None
@@ -1075,7 +1075,20 @@ def _feed_url(feed_object: Dict[str, Any], base_url: str) -> Optional[str]:
     return f"{base_url.rstrip('/')}/feed/{slug}"
 
 
-def build_public_item(feed_object: Dict[str, Any], base_url: str) -> Dict[str, Any]:
+def _post_url(feed_object: Dict[str, Any], base_url: str) -> Optional[str]:
+    """Build the upstream direct /post URL."""
+    slug = normalize_slug(feed_object.get("slug"))
+    if not slug:
+        return None
+
+    return f"{base_url.rstrip('/')}/post/{slug}"
+
+
+def build_public_item(
+    feed_object: Dict[str, Any],
+    base_url: str,
+    route: str = "feed",
+) -> Dict[str, Any]:
     """
     Convert one raw Desihub feed object to the public API item.
 
@@ -1092,7 +1105,7 @@ def build_public_item(feed_object: Dict[str, Any], base_url: str) -> Dict[str, A
     item: Dict[str, Any] = {
         "title": _clean_string(feed_object.get("title")),
         "slug": slug,
-        "url": _feed_url(feed_object, base_url),
+        "url": _post_url(feed_object, base_url) if route == "post" else _feed_url(feed_object, base_url),
         "type": classify_media(media),
         "media_count": len(media),
         "video_count": len(videos),
@@ -2070,7 +2083,7 @@ def _find_dom_post_match(html: str, requested_slug: str, base_url: str) -> Optio
     if feed_object is None:
         return None
 
-    return build_public_item(feed_object, base_url)
+    return build_public_item(feed_object, base_url, route="post")
 
 
 def _recommendation_thumbnail(anchor: Any, base_url: str) -> Optional[str]:
@@ -2277,18 +2290,30 @@ def parse_post_page(
         feed_objects = extract_rsc_feed_objects(html)
         match = find_feed_object_by_slug(feed_objects, wanted)
         if match is not None:
-            item = build_public_item(match, base_url)
+            item = build_public_item(match, base_url, route="post")
         else:
             near_slug_match = _extract_feed_object_near_slug(stream, wanted)
             if near_slug_match is not None:
-                item = build_public_item(near_slug_match, base_url)
+                item = build_public_item(near_slug_match, base_url, route="post")
             else:
                 partial_match = _extract_post_object_from_stream_by_slug(stream, wanted)
                 if partial_match is not None:
-                    item = build_public_item(partial_match, base_url)
+                    item = build_public_item(partial_match, base_url, route="post")
 
     if item is None:
         return None
+
+    # Direct /post pages do not always serialize the Mongo post _id in the
+    # rendered template. Keep the public id useful by falling back to the
+    # primary media UUID when no real post id is exposed. Never invent a
+    # database id.
+    if not item.get("id"):
+        videos = [
+            media for media in item.get("media", [])
+            if isinstance(media, dict) and media.get("type") == "video"
+        ]
+        if videos and videos[0].get("id"):
+            item["id"] = videos[0].get("id")
 
     recommendations = extract_post_recommendations(html, wanted, base_url)
     item["recommendation_count"] = len(recommendations)
@@ -2352,4 +2377,4 @@ __all__ = [
 
 
 # Backwards-compatible alias used by a few earlier parser revisions.
-extract_feed_objects = extract_rsc_feed_objects
+extract_feed_objects = extract_rsc_feed_objectsects
