@@ -1114,7 +1114,11 @@ def build_public_item(
         "embed_url": first_video.get("embed_url") if first_video else None,
         "video_id": first_video.get("video_id") if first_video else None,
         "video_url": first_video.get("video_url") if first_video else None,
-        "thumbnail": first_video.get("thumbnail") if first_video else None,
+        "thumbnail": (
+            first_video.get("thumbnail")
+            if first_video
+            else (images[0].get("image_url") if images else None)
+        ),
         "duration": first_video.get("duration") if first_video else None,
     }
 
@@ -1972,13 +1976,21 @@ def _extract_direct_post_jsonld(h1: Any, html: str, base_url: str) -> Dict[str, 
                 continue
 
             if "WebPage" in types:
-                image = obj.get("image")
-                if isinstance(image, list):
-                    image = image[0] if image else None
-                if isinstance(image, dict):
-                    image = image.get("url")
-                if image:
-                    result["thumbnail"] = absolute_url(image, base_url)
+                raw_images = obj.get("image")
+                if not isinstance(raw_images, list):
+                    raw_images = [raw_images] if raw_images else []
+
+                images: List[str] = []
+                for image in raw_images:
+                    if isinstance(image, dict):
+                        image = image.get("url") or image.get("contentUrl")
+                    image_url = absolute_url(image, base_url) if image else None
+                    if image_url and image_url not in images:
+                        images.append(image_url)
+
+                if images:
+                    result["images"] = images
+                    result["thumbnail"] = images[0]
                 result["created_at"] = result.get("created_at") or _clean_string(obj.get("datePublished"))
 
     return result
@@ -2005,16 +2017,39 @@ def _build_dom_post_object(
     if jsonld.get("video"):
         jvideo = jsonld["video"]
         if media:
-            video = media[0]
-            video["embed_url"] = jvideo.get("embed_url") or video.get("url")
-            video["video_id"] = jvideo.get("video_id") or video.get("videoId")
-            video["videoId"] = video.get("video_id")
-            video["id"] = video.get("video_id")
-            video["video_url"] = jvideo.get("video_url")
-            video["thumbnail"] = jvideo.get("thumbnail")
-            video["duration"] = jvideo.get("duration")
+            # The direct DOM can contain a featured image before the iframe.
+            # For a VideoObject page, retain the video media as the primary
+            # item and merge structured metadata into the actual iframe item.
+            video_index = next(
+                (index for index, entry in enumerate(media) if entry.get("type") == "video"),
+                None,
+            )
+            if video_index is not None:
+                video = media[video_index]
+                video["embed_url"] = jvideo.get("embed_url") or video.get("url")
+                video["video_id"] = jvideo.get("video_id") or video.get("videoId")
+                video["videoId"] = video.get("video_id")
+                video["id"] = video.get("video_id")
+                video["video_url"] = jvideo.get("video_url")
+                video["thumbnail"] = jvideo.get("thumbnail")
+                video["duration"] = jvideo.get("duration")
+                media = [video]
+            else:
+                media = [jvideo]
         else:
             media = [jvideo]
+    elif not media:
+        # Image-only /post pages publish their complete gallery in WebPage.image
+        # JSON-LD and do not contain a VideoObject or iframe. Do not classify
+        # these as unknown or mistake the fake/placeholder player for a video.
+        image_urls = jsonld.get("images") or []
+        if not image_urls and jsonld.get("thumbnail"):
+            image_urls = [jsonld["thumbnail"]]
+        media = [
+            {"type": "image", "url": image_url, "image_url": image_url}
+            for image_url in image_urls
+            if isinstance(image_url, str) and image_url.strip()
+        ]
 
     feed_object: Dict[str, Any] = {
         "_id": None,
