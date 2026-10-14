@@ -664,6 +664,33 @@ async def enrich_feed_post_media(item: Dict[str, Any]) -> Dict[str, Any]:
 # -----------------------------------------------------------------------------
 
 
+def _preserve_post_image_thumbnail(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep an image-gallery thumbnail when video enrichment has no video."""
+    if not isinstance(item, dict):
+        return item
+    media = item.get("media")
+    if not isinstance(media, list):
+        return item
+    if any(isinstance(entry, dict) and entry.get("type") == "video" for entry in media):
+        return item
+    first_image = next(
+        (
+            entry for entry in media
+            if isinstance(entry, dict)
+            and entry.get("type") == "image"
+            and (entry.get("image_url") or entry.get("url"))
+        ),
+        None,
+    )
+    if first_image:
+        item["thumbnail"] = first_image.get("image_url") or first_image.get("url")
+        item["video_id"] = None
+        item["video_url"] = None
+        item["embed_url"] = None
+        item["duration"] = None
+    return item
+
+
 async def _enrich_post_recommendations(
     recommendations: Any,
 ) -> List[Dict[str, Any]]:
@@ -712,6 +739,10 @@ async def _enrich_post_recommendations(
                 # duration through the embed/MP4 fallback without touching the
                 # recommendation list itself.
                 enriched = await enrich_feed_post_media(enriched)
+                # The shared video-enrichment helper intentionally syncs
+                # top-level fields to the first video. Restore the image
+                # thumbnail only in the /post path for image-gallery posts.
+                enriched = _preserve_post_image_thumbnail(enriched)
                 return enriched
             except Exception:
                 return item
@@ -1024,6 +1055,7 @@ async def post_page(request: Request, slug: str) -> Dict[str, Any]:
 
     # Enrich the main /post media from the same post/embed family.
     parsed = await enrich_feed_post_media(parsed)
+    parsed = _preserve_post_image_thumbnail(parsed)
 
     # IMPORTANT: /post recommendations are /post pages, not /feed pages.
     # Resolve them through their own route so their media metadata is retained.
